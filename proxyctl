@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
-"""proxyctl - manage the mihomo exit node (CLI + web panel). Run as root.
+"""proxyctl - control panel + CLI for this VPS: proxies, egress, exit node, CLIProxyAPI, firewall. Run as root.
 
-  proxyctl status              services, routing, selected proxy, exit IP
-  proxyctl list                proxies (* = active)
-  proxyctl add NAME PROXY      PROXY: socks5://user:pass@host:port, http://..., or host:port:user:pass
-  proxyctl remove NAME         delete a proxy
-  proxyctl use NAME            switch the active proxy (REJECT = block everything)
-  proxyctl test                latency of every proxy
-  proxyctl routing on|off      start/stop serving as a Tailscale exit node (on --force skips the proxy check)
-  proxyctl forwarding          check IP forwarding, enable it (persistently) if off
-  proxyctl secret              print the panel/API secret
-  proxyctl init                create the secret if missing, write config.yaml (setup.sh runs this)
-  proxyctl serve               run the web panel (the proxyctl-web service does this)
+  proxyctl status                      egress, exit IP, services, warnings
+  proxyctl list                        proxies (* = active)
+  proxyctl add NAME PROXY              PROXY: socks5://user:pass@host:port, http://..., or host:port:user:pass
+  proxyctl remove NAME                 delete a proxy
+  proxyctl use NAME                    switch the active proxy (REJECT = block everything)
+  proxyctl test                        latency of every proxy
+  proxyctl speed [NAME|direct]         download/upload speed of one proxy, or of every proxy and the VPS itself
+  proxyctl egress proxy|direct         send traffic through the selected proxy, or straight out of the VPS
+  proxyctl exit-node on|off            advertise this VPS as a Tailscale exit node
+  proxyctl set FEATURE on|off          FEATURE: kill-switch, proxy-dns, cliproxyapi, firewall
+  proxyctl ports                       firewall port rules and what listens on each port
+  proxyctl port PORT[/udp] tailscale|public|closed [LABEL]
+  proxyctl port remove PORT[/udp]
+  proxyctl forwarding                  check IP forwarding, enable it (persistently) if off
+  proxyctl derp                        DERP relay status and the derpMap to paste into the tailnet policy
+  proxyctl secret                      print the panel secret
+  proxyctl init | init-cliproxyapi | apply [--boot] | serve     used by setup.sh and the systemd units
 """
+import base64
+import hashlib
 import json
 import os
 import re
 import secrets
+import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -38,11 +48,37 @@ API = "http://127.0.0.1:9090"
 MIXED = "http://127.0.0.1:7890"
 GROUP = "PROXY"
 PANEL_PORT = 9091
+PANEL_HTML = ["/usr/local/share/proxyctl/panel.html",
+              os.path.join(os.path.dirname(os.path.realpath(__file__)), "panel.html")]
+CPA_DIR = "/opt/CLIProxyAPI"
+CPA_CONF = f"{CPA_DIR}/config.yaml"
+CPA_CONTAINER = "cli-proxy-api"
+CPA_PORT = 8317
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 RESERVED = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", GROUP}
 FWD = {"net.ipv4.ip_forward": "/proc/sys/net/ipv4/ip_forward",
        "net.ipv6.conf.all.forwarding": "/proc/sys/net/ipv6/conf/all/forwarding"}
+FEATURES = {"exit_node": False, "kill_switch": True, "proxy_dns": True, "cliproxyapi": True, "firewall": True}
+ACCESS = ("tailscale", "public", "closed")
+DEFAULT_PORTS = [
+    {"port": PANEL_PORT, "proto": "tcp", "access": "tailscale", "label": "proxyctl panel"},
+    {"port": 9090, "proto": "tcp", "access": "tailscale", "label": "mihomo API and UI"},
+    {"port": CPA_PORT, "proto": "tcp", "access": "tailscale", "label": "CLIProxyAPI"},
+] + [{"port": p, "proto": "tcp", "access": "tailscale", "label": "CLIProxyAPI login callback"}
+     for p in (8085, 1455, 54545, 51121, 11451)]
+SPEED_URL = "https://speed.cloudflare.com"
+SPEED_DOWN_BYTES = 25_000_000
+SPEED_UP_BYTES = 10_000_000
+SPEED_UP_FILE = "/tmp/proxyctl-speedtest.bin"
+SPEED_SECONDS = 15  # per direction: slow proxies stop at the time limit instead of the size
+DERP_DIR = "/var/lib/derper"
+DERP_UNIT = "/etc/systemd/system/derper.service"
+DERP_PORT = 443
+DERP_REGION = 900
 LOCK = threading.Lock()
+SPEED_LOCK = threading.Lock()
+LAST_TEST = {}
+LAST_SPEED = {}
 
 
 class Err(Exception):
@@ -50,13 +86,25 @@ class Err(Exception):
 
 
 def run(cmd, check=True):
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        if check:
+            raise Err(f"{cmd[0]} is not installed")
+        return ""
     if check and r.returncode != 0:
         raise Err(f"{' '.join(cmd)} failed: {(r.stderr or r.stdout).strip()}")
     return r.stdout
 
 
-# --- state.json: the source of truth for secret, proxies, routing ------------
+def ok(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+# --- state.json: the source of truth --------------------------------------
 
 def load_state():
     try:
@@ -64,9 +112,15 @@ def load_state():
             st = json.load(f)
     except FileNotFoundError:
         st = {}
+    if "routing" in st:  # older versions had a single routing flag
+        st.setdefault("exit_node", st.pop("routing"))
     st.setdefault("secret", "")
     st.setdefault("proxies", [])
-    st.setdefault("routing", False)
+    st.setdefault("egress", "proxy")
+    for key, default in FEATURES.items():
+        st.setdefault(key, default)
+    st.setdefault("ports", [dict(p) for p in DEFAULT_PORTS])
+    st.setdefault("cliproxyapi_keys", {})
     return st
 
 
@@ -98,12 +152,12 @@ def init():
     st = load_state()
     if not st["secret"]:
         st["secret"] = secrets.token_urlsafe(24)
-        save_state(st)
-        print("generated a new secret")
+        print("generated a new panel secret")
+    save_state(st)
     render(st)
 
 
-def apply(st):
+def restart_mihomo(st):
     """Save, rebuild config.yaml and restart mihomo (ExecStartPost re-adds the tun0 route)."""
     save_state(st)
     render(st)
@@ -135,21 +189,38 @@ def selected():
         return None
 
 
-def exit_info(timeout=8):
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": MIXED, "https": MIXED}))
+def ipinfo(via_proxy, timeout=15):
+    # residential proxies can take several seconds on a fresh connection
+    proxies = {"http": MIXED, "https": MIXED} if via_proxy else {}
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
     try:
         with opener.open("https://ipinfo.io/json", timeout=timeout) as r:
-            return json.load(r)
+            d = json.load(r)
+        return {k: d.get(k) for k in ("ip", "city", "country", "org")}
     except Exception:
         return None
+
+
+def exit_ips():
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        proxy, direct = ex.map(ipinfo, (True, False))
+    return {"proxy": proxy, "direct": direct}
 
 
 def delay(name):
-    q = urllib.parse.urlencode({"url": "https://www.gstatic.com/generate_204", "timeout": 5000})
+    """(ms, None) on success, (None, mihomo's error message) on failure."""
+    # plain HTTP: one round trip less than HTTPS, so slow proxies don't time out on the TLS handshake
+    q = urllib.parse.urlencode({"url": "http://www.gstatic.com/generate_204", "timeout": 10000})
     try:
-        return api("GET", f"/proxies/{urllib.parse.quote(name, safe='')}/delay?{q}", timeout=8).get("delay")
-    except Exception:
-        return None
+        return api("GET", f"/proxies/{urllib.parse.quote(name, safe='')}/delay?{q}", timeout=15).get("delay"), None
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("message")
+        except Exception:
+            msg = None
+        return None, msg or f"HTTP {e.code}"
+    except Exception as e:
+        return None, str(getattr(e, "reason", e))
 
 
 # --- proxies ----------------------------------------------------------------
@@ -191,7 +262,7 @@ def add_proxy(name, spec):
         if any(x["name"] == p["name"] for x in st["proxies"]):
             raise Err(f"{p['name']} already exists")
         st["proxies"].append(p)
-        apply(st)
+        restart_mihomo(st)
 
 
 def remove_proxy(name):
@@ -201,7 +272,9 @@ def remove_proxy(name):
         if len(left) == len(st["proxies"]):
             raise Err(f"no proxy named {name}")
         st["proxies"] = left
-        apply(st)
+        LAST_TEST.pop(name, None)
+        LAST_SPEED.pop(name, None)
+        restart_mihomo(st)
 
 
 def use_proxy(name):
@@ -215,20 +288,80 @@ def use_proxy(name):
         pass
 
 
-def proxies_view():
-    st = load_state()
-    return {"now": selected(), "proxies": [
-        {k: p[k] for k in ("name", "type", "server", "port")} | {"auth": "username" in p}
-        for p in st["proxies"]]}
-
-
 def test_all():
     names = [p["name"] for p in load_state()["proxies"]]
     with ThreadPoolExecutor(max_workers=8) as ex:
-        return dict(zip(names, ex.map(delay, names)))
+        results = {n: {"ms": ms, "error": err, "at": int(time.time())}
+                   for n, (ms, err) in zip(names, ex.map(delay, names))}
+    LAST_TEST.clear()
+    LAST_TEST.update(results)
+    return results
 
 
-# --- forwarding, DNS, routing -----------------------------------------------
+def curl_quote(s):
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def curl_transfer(proxy, opts):
+    """One timed curl transfer. Returns curl's -w numbers, or raises Err.
+    Options go in on stdin (-K -) so the proxy password never shows up in ps."""
+    conf = list(opts) + ['write-out = "%{size_download} %{size_upload} %{time_pretransfer} %{time_starttransfer} %{time_total}"',
+                         "silent", "show-error", "output = /dev/null", f"max-time = {SPEED_SECONDS}"]
+    if proxy:
+        scheme = {"socks5": "socks5h", "http": "https" if proxy.get("tls") else "http"}[proxy["type"]]
+        conf.append("proxy = " + curl_quote(f"{scheme}://{proxy['server']}:{proxy['port']}"))
+        if "username" in proxy:
+            conf.append(f"proxy-user = {curl_quote(proxy['username'] + ':' + proxy['password'])}")
+    try:
+        r = subprocess.run(["curl", "-K", "-"], input="\n".join(conf) + "\n", capture_output=True, text=True,
+                           timeout=SPEED_SECONDS + 15)
+    except FileNotFoundError:
+        raise Err("curl is not installed")
+    except subprocess.TimeoutExpired:
+        raise Err("curl hung")
+    nums = r.stdout.split()
+    # exit 28 = hit max-time, which is fine: the bytes moved so far still give the speed
+    if r.returncode not in (0, 28) or len(nums) != 5:
+        raise Err((r.stderr.strip().splitlines() or [f"curl exit {r.returncode}"])[-1].removeprefix("curl: "))
+    return [float(n) for n in nums]
+
+
+def speed_test(name):
+    """Download and upload speed through one proxy (or DIRECT from the VPS), bypassing mihomo."""
+    if name.upper() == "DIRECT":
+        name, proxy = "DIRECT", None
+    else:
+        proxy = next((p for p in load_state()["proxies"] if p["name"] == name), None)
+        if not proxy:
+            raise Err(f"no proxy named {name}")
+    if not SPEED_LOCK.acquire(blocking=False):
+        raise Err("a speed test is already running, wait for it to finish")
+    try:
+        res = {"at": int(time.time())}
+        try:
+            down, _, _, first, total = curl_transfer(proxy, [f'url = "{SPEED_URL}/__down?bytes={SPEED_DOWN_BYTES}"'])
+            if not down:
+                raise Err("no data came back")
+            # time from the first byte, so the proxy's connection setup doesn't count against its bandwidth
+            res["down_mbps"] = round(down * 8 / 1e6 / max(total - first, 0.001), 2)
+            res["ttfb_ms"] = round(first * 1000)
+            with open(SPEED_UP_FILE, "wb") as f:
+                f.write(bytes(SPEED_UP_BYTES))
+            _, up, pre, _, total = curl_transfer(proxy, [f'url = "{SPEED_URL}/__up"', f'upload-file = "{SPEED_UP_FILE}"',
+                                                         'request = "POST"'])
+            res["up_mbps"] = round(up * 8 / 1e6 / max(total - pre, 0.001), 2) if up else None
+        except Err as e:
+            res["error"] = str(e)
+        finally:
+            if os.path.exists(SPEED_UP_FILE):
+                os.remove(SPEED_UP_FILE)
+        LAST_SPEED[name] = res
+        return res
+    finally:
+        SPEED_LOCK.release()
+
+
+# --- forwarding and DNS -----------------------------------------------------
 
 def fwd_values():
     out = {}
@@ -262,7 +395,7 @@ def enable_forwarding():
 
 
 def dns_to_mihomo():
-    # Clients using the exit node resolve through the VPS's resolver: send that through the proxy too.
+    # Exit-node clients resolve through the VPS's resolver: send that through the proxy too.
     if not os.path.lexists(RESOLV_BACKUP):
         os.rename(RESOLV, RESOLV_BACKUP)  # keeps a systemd-resolved symlink as a symlink
     elif os.path.lexists(RESOLV):
@@ -278,69 +411,423 @@ def dns_restore():
         os.rename(RESOLV_BACKUP, RESOLV)
 
 
-def routing_on(force=False):
-    with LOCK:
-        enable_forwarding()
-        if not force:
-            if selected() in (None, "REJECT"):
-                raise Err("no proxy selected: add one first")
-            if not exit_info():
-                raise Err("the selected proxy doesn't reach the internet, so routing stays off")
+def dns_via_mihomo():
+    return os.path.lexists(RESOLV_BACKUP)
+
+
+# --- firewall and exit-node routing -----------------------------------------
+
+def wan_if():
+    out = run(["ip", "-4", "route", "show", "default"], check=False).split()
+    return out[out.index("dev") + 1] if "dev" in out else None
+
+
+def own_chain(ipt, table, chain, parent):
+    """Create/flush our chain and make sure the parent jumps to it first."""
+    ok([ipt, "-t", table, "-N", chain])
+    run([ipt, "-t", table, "-F", chain])
+    if not ok([ipt, "-t", table, "-C", parent, "-j", chain]):
+        run([ipt, "-t", table, "-I", parent, "1", "-j", chain])
+
+
+def apply_firewall(st, warns):
+    # In mangle INPUT, so it runs before Tailscale's, Docker's or ufw's filter rules can accept the packet.
+    for ipt in ("iptables", "ip6tables"):
+        try:
+            own_chain(ipt, "mangle", "PM-INPUT", "INPUT")
+            if not st["firewall"]:
+                continue
+            run([ipt, "-t", "mangle", "-A", "PM-INPUT", "-i", "lo", "-j", "RETURN"])
+            for p in st["ports"]:
+                rule = [ipt, "-t", "mangle", "-A", "PM-INPUT", "-p", p["proto"], "--dport", str(p["port"])]
+                if p["access"] == "tailscale":
+                    run(rule + ["!", "-i", "tailscale0", "-j", "DROP"])
+                elif p["access"] == "closed":
+                    run(rule + ["-j", "DROP"])
+        except Err as e:
+            if ipt == "iptables":
+                raise
+            warns.append(f"IPv6 firewall rules not applied: {e}")
+
+
+def apply_exit_routing(st, warns):
+    proxied = st["exit_node"] and st["egress"] == "proxy"
+    while ok(["ip", "rule", "del", "priority", "100"]):
+        pass
+    for ipt in ("iptables", "ip6tables"):
+        try:
+            own_chain(ipt, "mangle", "PM-FWD", "FORWARD")
+        except Err as e:
+            if ipt == "iptables":
+                raise
+            warns.append(f"IPv6 forwarding rules not applied: {e}")
+    if proxied:
+        # Everything arriving from Tailscale goes to table 100: tun0 (mihomo), and with the kill switch a blackhole behind it.
+        run(["ip", "rule", "add", "iif", "tailscale0", "lookup", "100", "priority", "100"])
+        run(["ip", "route", "replace", "throw", "100.64.0.0/10", "table", "100"])
+        # mihomo has no IPv6 out: drop it rather than let it leave directly
+        ok(["ip6tables", "-t", "mangle", "-A", "PM-FWD", "-i", "tailscale0", "-j", "DROP"])
+        if st["kill_switch"]:
+            run(["ip", "route", "replace", "blackhole", "default", "table", "100", "metric", "500"])
+            wan = wan_if()
+            if wan:
+                run(["iptables", "-t", "mangle", "-A", "PM-FWD", "-i", "tailscale0", "-o", wan, "-j", "DROP"])
+            else:
+                warns.append("could not detect the WAN interface; only the blackhole route guards the kill switch")
+        else:
+            ok(["ip", "route", "del", "blackhole", "default", "table", "100", "metric", "500"])
+    if st["exit_node"] and ok(["iptables", "-n", "-L", "DOCKER-USER"]):
+        # Docker sets the FORWARD policy to DROP, which stalls exit-node traffic
+        for d in ("-i", "-o"):
+            if not ok(["iptables", "-C", "DOCKER-USER", d, "tailscale0", "-j", "ACCEPT"]):
+                run(["iptables", "-I", "DOCKER-USER", "1", d, "tailscale0", "-j", "ACCEPT"])
+
+
+# --- CLIProxyAPI ------------------------------------------------------------
+
+def _cpa_proxy_line(lines):
+    """(index of `requests:`, index of its proxy-url line, child indent)."""
+    for i, line in enumerate(lines):
+        if re.match(r"^requests\s*:\s*(#.*)?$", line):
+            indent = None
+            for j in range(i + 1, len(lines)):
+                s = lines[j]
+                if not s.strip() or s.lstrip().startswith("#"):
+                    continue
+                if not s[0].isspace():
+                    break
+                ind = len(s) - len(s.lstrip())
+                indent = indent if indent is not None else ind
+                if ind == indent and re.match(r"\s*proxy-url\s*:", s):
+                    return i, j, indent
+            return i, None, indent or 2
+    return None, None, 2
+
+
+def cpa_get_proxy_url(text):
+    lines = text.splitlines()
+    _, j, _ = _cpa_proxy_line(lines)
+    if j is None:
+        return ""
+    return lines[j].split(":", 1)[1].split(" #", 1)[0].strip().strip("\"'")
+
+
+def cpa_set_proxy_url(text, url):
+    lines = text.splitlines()
+    i, j, indent = _cpa_proxy_line(lines)
+    line = " " * indent + f"proxy-url: {json.dumps(url)}"
+    if j is not None:
+        lines[j] = line
+    elif i is not None:
+        lines.insert(i + 1, line)
+    else:
+        lines += ["", "requests:", f"  proxy-url: {json.dumps(url)}"]
+    return "\n".join(lines) + "\n"
+
+
+def cpa_container():
+    return run(["docker", "inspect", "-f", "{{.State.Status}}", CPA_CONTAINER], check=False).strip() or None
+
+
+def cpa_wanted_url(st):
+    return MIXED if st["egress"] == "proxy" else ""
+
+
+def apply_cliproxyapi(st, warns):
+    if not st["cliproxyapi"]:
+        return
+    if not os.path.exists(CPA_CONF):
+        warns.append(f"CLIProxyAPI is not installed ({CPA_CONF} missing)")
+        return
+    with open(CPA_CONF) as f:
+        text = f.read()
+    new = cpa_set_proxy_url(text, cpa_wanted_url(st))
+    if new == text:
+        return
+    with open(CPA_CONF, "w") as f:
+        f.write(new)
+    if cpa_container() == "running" and not ok(["docker", "restart", CPA_CONTAINER]):
+        warns.append("CLIProxyAPI config updated, but restarting its container failed")
+
+
+def init_cliproxyapi():
+    """Create CLIProxyAPI's config.yaml with generated keys (only if missing) and the host-network override."""
+    st = load_state()
+    if not os.path.exists(CPA_CONF):
+        shutil.copy(f"{CPA_DIR}/config.example.yaml", CPA_CONF)
+        keys = {"management": secrets.token_urlsafe(24), "api": "sk-" + secrets.token_urlsafe(32)}
+        with open(CPA_CONF) as f:
+            text = f.read()
+        text = re.sub(r"(?m)^(\s+allow-remote:)\s*false\b", r"\1 true", text, count=1)
+        text = re.sub(r'(?m)^(\s+secret-key:)\s*""', lambda m: f"{m.group(1)} {json.dumps(keys['management'])}", text, count=1)
+        text = re.sub(r"(?m)^(\s+api-keys:[^\n]*\n)((\s+)- [^\n]*\n)+",
+                      lambda m: f"{m.group(1)}{m.group(3)}- {json.dumps(keys['api'])}\n", text, count=1)
+        with open(CPA_CONF, "w") as f:
+            f.write(text)
+        st["cliproxyapi_keys"] = keys
+        save_state(st)
+        print("CLIProxyAPI config created with new management and API keys")
+    override = f"{CPA_DIR}/docker-compose.override.yml"
+    if not os.path.exists(override):
+        # Host networking: its ports fall under the panel's firewall rules (Docker's published
+        # ports would bypass them), and it can reach mihomo on 127.0.0.1:7890.
+        with open(override, "w") as f:
+            f.write("services:\n  cli-proxy-api:\n    network_mode: host\n    ports: !reset []\n")
+
+
+# --- DERP relay (setup.sh --derp) -------------------------------------------
+
+def derp_info():
+    """derper's state and the derpMap block for the tailnet policy file (None until its cert exists)."""
+    if not os.path.exists(DERP_UNIT):
+        return {"installed": False}
+    info = {"installed": True, "service": run(["systemctl", "is-active", "derper"], check=False).strip() or "unknown",
+            "host": None, "acl": None}
+    try:
+        certs = sorted(f for f in os.listdir(DERP_DIR) if f.endswith(".crt"))
+    except FileNotFoundError:
+        certs = []
+    if not certs:
+        return info
+    with open(os.path.join(DERP_DIR, certs[0])) as f:
+        pem = f.read()
+    der = base64.b64decode("".join(l for l in pem.split("-----END")[0].splitlines() if l and not l.startswith("-----")))
+    host = certs[0][:-len(".crt")]
+    # self-signed for an IP: clients trust it because CertName pins its hash
+    node = {"Name": f"{DERP_REGION}a", "RegionID": DERP_REGION, "HostName": host, "DERPPort": DERP_PORT,
+            "CertName": "sha256-raw:" + hashlib.sha256(der).hexdigest()}
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
+        node["IPv4"] = host
+    derp_map = {"OmitDefaultRegions": True, "Regions": {str(DERP_REGION): {
+        "RegionID": DERP_REGION, "RegionCode": "vps", "RegionName": socket.gethostname(), "Nodes": [node]}}}
+    info["host"] = host
+    info["acl"] = '"derpMap": ' + json.dumps(derp_map, indent=2) + ","
+    return info
+
+
+# --- apply everything -------------------------------------------------------
+
+def apply_net(st, boot=False):
+    """Make the system match state.json. Returns a list of warnings."""
+    warns = []
+    apply_firewall(st, warns)
+    apply_exit_routing(st, warns)
+    if st["exit_node"] and st["egress"] == "proxy" and st["proxy_dns"]:
         dns_to_mihomo()
-        run(["tailscale", "set", "--advertise-exit-node=true"])
-        st = load_state()
-        st["routing"] = True
-        save_state(st)
-
-
-def routing_off():
-    with LOCK:
-        run(["tailscale", "set", "--advertise-exit-node=false"])
+    else:
         dns_restore()
+    if not boot:  # at boot, tailscaled and docker keep their own saved state
+        if st["exit_node"]:
+            enable_forwarding()
+        if not ok(["tailscale", "set", f"--advertise-exit-node={'true' if st['exit_node'] else 'false'}"]):
+            warns.append("tailscale set --advertise-exit-node failed: is Tailscale logged in?")
+        apply_cliproxyapi(st, warns)
+    return warns
+
+
+def change(fn):
+    """Load state, let fn modify it, save and apply. Returns warnings."""
+    with LOCK:
         st = load_state()
-        st["routing"] = False
+        fn(st)
         save_state(st)
+        return apply_net(st)
 
 
-def status():
+def set_settings(body):
+    def edit(st):
+        if "egress" in body:
+            if body["egress"] not in ("proxy", "direct"):
+                raise Err("egress must be proxy or direct")
+            st["egress"] = body["egress"]
+        for key in FEATURES:
+            if key in body:
+                st[key] = bool(body[key])
+    return change(edit)
+
+
+def parse_port(spec):
+    port, _, proto = str(spec).partition("/")
+    proto = proto or "tcp"
+    if not port.isdigit() or not 1 <= int(port) <= 65535 or proto not in ("tcp", "udp"):
+        raise Err("port must be 1-65535, optionally /tcp or /udp")
+    return int(port), proto
+
+
+def set_port(spec, access, label=None):
+    port, proto = parse_port(spec)
+    if access not in ACCESS:
+        raise Err("access must be tailscale, public or closed")
+    if port == PANEL_PORT and proto == "tcp" and access == "closed":
+        raise Err("closing the panel's own port would lock you out of it")
+
+    def edit(st):
+        for p in st["ports"]:
+            if p["port"] == port and p["proto"] == proto:
+                p["access"] = access
+                if label is not None:
+                    p["label"] = label[:40]
+                return
+        st["ports"].append({"port": port, "proto": proto, "access": access, "label": (label or "")[:40]})
+        st["ports"].sort(key=lambda p: (p["port"], p["proto"]))
+    return change(edit)
+
+
+def remove_port(spec):
+    port, proto = parse_port(spec)
+
+    def edit(st):
+        left = [p for p in st["ports"] if not (p["port"] == port and p["proto"] == proto)]
+        if len(left) == len(st["ports"]):
+            raise Err(f"no rule for {port}/{proto}")
+        st["ports"] = left
+    return change(edit)
+
+
+# --- views ------------------------------------------------------------------
+
+def listeners():
+    """{(proto, port): {"process": name, "local_only": bool}} from ss."""
+    res = {}
+    for line in run(["ss", "-Hlntup"], check=False).splitlines():
+        f = line.split()
+        if len(f) < 5:
+            continue
+        addr, _, port = f[4].rpartition(":")
+        if not port.isdigit():
+            continue
+        e = res.setdefault((f[0], int(port)), {"process": None, "local_only": True})
+        m = re.search(r'users:\(\("([^"]+)"', line)
+        if m and not e["process"]:
+            e["process"] = m.group(1)
+        host = addr.split("%")[0].strip("[]")
+        if not (host.startswith("127.") or host == "::1"):
+            e["local_only"] = False
+    return res
+
+
+def tailscale_ip():
+    out = run(["tailscale", "ip", "-4"], check=False).split()
+    return out[0] if out else None
+
+
+def warnings_for(st, now, health, cpa):
+    w = []
+    if st["egress"] == "proxy" and now in (None, "REJECT"):
+        users = [n for n, on in (("CLIProxyAPI", st["cliproxyapi"]), ("exit-node clients", st["exit_node"])) if on]
+        w.append(f"No proxy selected, so {' and '.join(users) or 'proxied traffic'} can't reach the internet. "
+                 "Add a proxy, or switch egress to direct.")
+    if st["egress"] == "proxy" and health["mihomo"] != "active":
+        w.append("mihomo is not running, so proxied traffic is blocked: systemctl status mihomo")
+    if st["exit_node"] and not health["forwarding"]:
+        w.append("IP forwarding is off, so exit-node clients can't load anything.")
+    if not st["firewall"]:
+        w.append(f"Firewall rules are off: this panel (port {PANEL_PORT}) is reachable from the internet.")
+    if st["cliproxyapi"] and cpa["installed"] and cpa["proxy_url"] != cpa_wanted_url(st):
+        w.append("CLIProxyAPI's proxy-url doesn't match the egress setting.")
+    if st["egress"] == "proxy" and st["exit_node"] and not st["kill_switch"]:
+        w.append("Kill switch is off: if the proxy goes down, exit-node traffic leaves via the VPS's own IP.")
+    return w
+
+
+def overview():
+    st = load_state()
+    now = selected()
+    lst = listeners()
     rule = run(["ip", "rule", "show", "priority", "100"], check=False)
     route = run(["ip", "route", "show", "table", "100"], check=False)
-    return {
-        "routing": load_state()["routing"],
-        "forwarding": fwd_on(),
+    health = {
         "mihomo": run(["systemctl", "is-active", "mihomo"], check=False).strip() or "unknown",
-        "kill_switch": "lookup 100" in rule,
+        "forwarding": fwd_on(),
+        "exit_rule": "lookup 100" in rule,
         "tun_route": "dev tun0" in route,
-        "selected": selected(),
-        "exit": exit_info(),
+        "dns_via_mihomo": dns_via_mihomo(),
+    }
+    cpa_text = ""
+    if os.path.exists(CPA_CONF):
+        with open(CPA_CONF) as f:
+            cpa_text = f.read()
+    ts_ip = tailscale_ip()
+    cpa = {
+        "installed": bool(cpa_text),
+        "container": cpa_container() if cpa_text else None,
+        "proxy_url": cpa_get_proxy_url(cpa_text) if cpa_text else None,
+        "endpoint": f"http://{ts_ip or '<tailscale-ip>'}:{CPA_PORT}/v1",
+        "management": f"http://{ts_ip or '<tailscale-ip>'}:{CPA_PORT}/management.html",
+        "keys": st["cliproxyapi_keys"],
+    }
+    ports = []
+    for p in st["ports"]:
+        listener = lst.get((p["proto"], p["port"]))
+        ports.append(p | {"listening": bool(listener),
+                          "process": listener and listener["process"],
+                          "local_only": bool(listener and listener["local_only"])})
+    return {
+        "host": socket.gethostname(),
+        "tailscale_ip": ts_ip,
+        "wan": wan_if(),
+        "egress": st["egress"],
+        "features": {k: st[k] for k in FEATURES},
+        "selected": now,
+        "proxies": [{k: p[k] for k in ("name", "type", "server", "port")} | {"auth": "username" in p}
+                    for p in st["proxies"]],
+        "latency": LAST_TEST,
+        "speed": LAST_SPEED,
+        "ports": ports,
+        "health": health,
+        "cliproxyapi": cpa,
+        "derp": derp_info(),
+        "warnings": warnings_for(st, now, health, cpa),
+        "panel_port": PANEL_PORT,
+        "at": int(time.time()),
     }
 
 
 # --- web panel --------------------------------------------------------------
 
 def route(method, path, body):
-    if (method, path) == ("GET", "status"):
-        return status()
-    if (method, path) == ("GET", "proxies"):
-        return proxies_view()
-    if (method, path) == ("POST", "proxies"):
-        add_proxy(str(body.get("name", "")), str(body.get("proxy", "")))
-        return proxies_view()
-    if method == "DELETE" and path.startswith("proxies/"):
-        remove_proxy(urllib.parse.unquote(path[len("proxies/"):]))
-        return proxies_view()
-    if (method, path) == ("PUT", "select"):
-        use_proxy(str(body.get("name", "")))
-        return proxies_view()
+    if (method, path) == ("GET", "state"):
+        return overview()
+    if (method, path) == ("GET", "exit"):
+        return exit_ips()
     if (method, path) == ("GET", "test"):
         return test_all()
-    if (method, path) == ("POST", "routing"):
-        routing_on() if body.get("on") else routing_off()
-        return status()
-    if (method, path) == ("POST", "forwarding"):
+    if (method, path) == ("POST", "speedtest"):
+        return speed_test(str(body.get("name", "")))
+    if (method, path) == ("POST", "proxies"):
+        add_proxy(str(body.get("name", "")), str(body.get("proxy", "")))
+    elif method == "DELETE" and path.startswith("proxies/"):
+        remove_proxy(urllib.parse.unquote(path[len("proxies/"):]))
+    elif (method, path) == ("PUT", "select"):
+        use_proxy(str(body.get("name", "")))
+    elif (method, path) == ("POST", "settings"):
+        warns = set_settings(body)
+        return overview() | {"applied": warns}
+    elif (method, path) == ("POST", "ports"):
+        label = body.get("label")
+        warns = set_port(f"{body.get('port')}/{body.get('proto', 'tcp')}", str(body.get("access", "")),
+                         None if label is None else str(label))
+        return overview() | {"applied": warns}
+    elif method == "DELETE" and path.startswith("ports/"):
+        warns = remove_port(urllib.parse.unquote(path[len("ports/"):]))
+        return overview() | {"applied": warns}
+    elif (method, path) == ("POST", "apply"):
+        with LOCK:
+            warns = apply_net(load_state())
+        return overview() | {"applied": warns}
+    elif (method, path) == ("POST", "forwarding"):
         enable_forwarding()
-        return status()
-    raise Err("unknown endpoint")
+    else:
+        raise Err("unknown endpoint")
+    return overview()
+
+
+def panel_page():
+    for path in PANEL_HTML:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return f.read()
+    return b"panel.html not found: re-run setup.sh"
 
 
 class Panel(BaseHTTPRequestHandler):
@@ -359,7 +846,7 @@ class Panel(BaseHTTPRequestHandler):
     def handle_any(self, method):
         path = urllib.parse.urlsplit(self.path).path
         if method == "GET" and path in ("/", "/index.html"):
-            return self.reply(200, raw=PAGE.encode(), ctype="text/html; charset=utf-8")
+            return self.reply(200, raw=panel_page(), ctype="text/html; charset=utf-8")
         if not path.startswith("/api/"):
             return self.reply(404, {"error": "not found"})
         secret = load_state()["secret"]
@@ -388,174 +875,42 @@ class Panel(BaseHTTPRequestHandler):
         self.handle_any("DELETE")
 
 
-PAGE = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Exit Node Panel</title>
-<style>
-:root{--bg:#f5f5f2;--card:#fff;--fg:#1d1d1b;--mut:#6d6d67;--line:#e2e2dc;--acc:#2f6fdb;--ok:#1d8048;--bad:#c2372e}
-@media (prefers-color-scheme:dark){:root{--bg:#141413;--card:#1d1d1b;--fg:#ecece7;--mut:#9b9b94;--line:#30302c;--acc:#6f9cf0;--ok:#4cc27e;--bad:#ef6a5f}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,sans-serif}
-main{max-width:720px;margin:0 auto;padding:24px 16px 64px}
-h1{font-size:20px;margin:0 0 14px}
-h2{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:var(--mut);margin:0 0 10px}
-section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:14px}
-.kv{display:grid;grid-template-columns:auto 1fr;gap:6px 18px}.kv span:nth-child(odd){color:var(--mut)}
-.ok{color:var(--ok)}.bad{color:var(--bad)}.mut{color:var(--mut)}
-#msg{min-height:22px;margin:0 0 12px;overflow-wrap:anywhere}
-button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:7px;padding:6px 12px;cursor:pointer}
-button.pri{background:var(--acc);border-color:var(--acc);color:#fff}
-button:disabled{opacity:.5;cursor:default}
-input{font:inherit;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--fg);min-width:0}
-table{width:100%;border-collapse:collapse}
-td{padding:8px 4px;border-top:1px solid var(--line);vertical-align:middle}
-tr:first-child td{border-top:0}
-td.ctl{text-align:right;white-space:nowrap}
-.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
-#name{flex:0 1 150px}#proxy{flex:1 1 260px}
-@media (max-width:540px){td.srv{display:none}}
-</style></head>
-<body><main>
-<h1>Exit node</h1>
-<p id="msg"></p>
-<section><h2>Status</h2><div class="kv" id="status"><span>loading…</span></div>
-<div class="row"><button id="rt" class="pri" disabled>Start routing</button><button id="fw" hidden>Enable IP forwarding</button></div></section>
-<section><h2>Proxies</h2><table id="list"></table>
-<div class="row"><button id="test">Test latency</button><button id="block">Block all (REJECT)</button></div></section>
-<section><h2>Add proxy</h2>
-<div class="row" style="margin-top:0"><input id="name" placeholder="name, e.g. isp-1" autocomplete="off">
-<input id="proxy" placeholder="socks5://user:pass@1.2.3.4:1080 or host:port:user:pass" autocomplete="off">
-<button id="add" class="pri">Add</button></div>
-<p class="mut" style="margin:10px 0 0">Adding or removing a proxy restarts mihomo, which drops connections for a second.</p></section>
-</main>
-<script>
-const $ = id => document.getElementById(id);
-let SECRET = '', ROUTING = false, LAT = {};
-try { SECRET = localStorage.getItem('secret') || '' } catch (e) {}
-
-function askSecret() {
-  const s = prompt('Panel secret (run "sudo proxyctl secret" on the VPS):');
-  if (s) { SECRET = s.trim(); try { localStorage.setItem('secret', SECRET) } catch (e) {} }
-}
-async function call(method, path, body) {
-  const r = await fetch('/api/' + path, {method, headers: {'Authorization': 'Bearer ' + SECRET, 'Content-Type': 'application/json'},
-    body: body ? JSON.stringify(body) : undefined});
-  const d = await r.json().catch(() => ({}));
-  if (r.status === 401) { askSecret(); throw new Error('Wrong secret, try again'); }
-  if (!r.ok) throw new Error(d.error || r.statusText);
-  return d;
-}
-function say(text, bad) { $('msg').textContent = text; $('msg').className = bad ? 'bad' : 'ok'; }
-async function act(btn, fn) {
-  btn.disabled = true;
-  try { await fn() } catch (e) { say(e.message, true) } finally { btn.disabled = false }
-}
-function button(label, onclick) { const b = document.createElement('button'); b.textContent = label; b.onclick = onclick; return b; }
-
-async function loadStatus() {
-  const s = await call('GET', 'status'), e = s.exit, el = $('status');
-  const rows = [
-    ['Routing', s.routing ? 'on, serving as exit node' : 'off', s.routing ? 'ok' : 'mut'],
-    ['IP forwarding', s.forwarding ? 'on' : 'OFF', s.forwarding ? 'ok' : 'bad'],
-    ['mihomo', s.mihomo, s.mihomo === 'active' ? 'ok' : 'bad'],
-    ['Kill switch', s.kill_switch ? 'on' : 'OFF', s.kill_switch ? 'ok' : 'bad'],
-    ['Selected', s.selected || '?', s.selected === 'REJECT' ? 'bad' : ''],
-    ['Exit IP', e ? [e.ip, [e.city, e.country].filter(Boolean).join(', '), e.org].filter(Boolean).join(' · ') : 'unreachable', e ? '' : 'bad'],
-  ];
-  el.replaceChildren();
-  for (const [k, v, cls] of rows) {
-    const a = document.createElement('span'), b = document.createElement('span');
-    a.textContent = k; b.textContent = v; if (cls) b.className = cls; el.append(a, b);
-  }
-  ROUTING = s.routing;
-  $('rt').textContent = s.routing ? 'Stop routing' : 'Start routing';
-  $('rt').className = s.routing ? '' : 'pri';
-  $('rt').disabled = false;
-  $('fw').hidden = s.forwarding;
-}
-
-async function loadProxies(d) {
-  d = d || await call('GET', 'proxies');
-  const t = $('list');
-  t.replaceChildren();
-  if (!d.proxies.length) {
-    const td = t.insertRow().insertCell(); td.className = 'mut'; td.textContent = 'No proxies yet. Add one below.'; return;
-  }
-  for (const p of d.proxies) {
-    const tr = t.insertRow(), cell = (text, cls) => { const c = tr.insertCell(); c.textContent = text; if (cls) c.className = cls; return c; };
-    cell(p.name === d.now ? '●' : '', 'ok');
-    cell(p.name);
-    cell(p.type + ' ' + p.server + ':' + p.port, 'srv mut');
-    cell(p.name in LAT ? (LAT[p.name] ? LAT[p.name] + ' ms' : 'timeout') : '', LAT[p.name] === null ? 'bad' : 'mut');
-    const ctl = cell('', 'ctl');
-    if (p.name !== d.now) {
-      const u = button('Use', () => act(u, async () => {
-        await loadProxies(await call('PUT', 'select', {name: p.name})); say('Switched to ' + p.name); loadStatus();
-      }));
-      ctl.append(u, ' ');
-    }
-    const x = button('Remove', () => {
-      if (!confirm('Remove ' + p.name + '?')) return;
-      act(x, async () => {
-        say('Removing ' + p.name + ', restarting mihomo…');
-        await loadProxies(await call('DELETE', 'proxies/' + encodeURIComponent(p.name))); say('Removed ' + p.name); loadStatus();
-      });
-    });
-    ctl.append(x);
-  }
-}
-
-$('rt').onclick = () => act($('rt'), async () => {
-  const on = !ROUTING;
-  say(on ? 'Checking the proxy, then starting…' : 'Stopping…');
-  await call('POST', 'routing', {on});
-  say(on ? 'Routing on. If this is the first time, allow the exit node in the Tailscale admin console.' : 'Routing off');
-  await loadStatus();
-});
-$('fw').onclick = () => act($('fw'), async () => { await call('POST', 'forwarding'); say('IP forwarding enabled'); await loadStatus(); });
-$('test').onclick = () => act($('test'), async () => { say('Testing…'); LAT = await call('GET', 'test'); await loadProxies(); say('Latency updated'); });
-$('block').onclick = () => act($('block'), async () => {
-  await loadProxies(await call('PUT', 'select', {name: 'REJECT'})); say('All exit-node traffic is now blocked'); loadStatus();
-});
-$('add').onclick = () => act($('add'), async () => {
-  const name = $('name').value.trim(), proxy = $('proxy').value.trim();
-  if (!name || !proxy) throw new Error('Fill in a name and the proxy');
-  say('Adding ' + name + ', restarting mihomo…');
-  await loadProxies(await call('POST', 'proxies', {name, proxy}));
-  $('name').value = ''; $('proxy').value = ''; say('Added ' + name); loadStatus();
-});
-
-(async () => {
-  if (!SECRET) askSecret();
-  try { await loadProxies(); await loadStatus(); } catch (e) { say(e.message, true) }
-})();
-</script>
-</body></html>
-"""
-
-
 # --- CLI --------------------------------------------------------------------
+
+def onoff(value):
+    if value not in ("on", "off"):
+        raise Err("expected on or off")
+    return value == "on"
+
+
+def print_warnings(warns):
+    for w in warns:
+        print(f"warning: {w}")
+
 
 def cli(args):
     cmd = args[0] if args else "status"
     if cmd == "status":
-        s = status()
-        e = s["exit"]
-        print(f"routing:     {'on' if s['routing'] else 'off'}")
-        print(f"forwarding:  {'on' if s['forwarding'] else 'OFF'}")
-        print(f"mihomo:      {s['mihomo']}")
-        print(f"kill switch: {'on' if s['kill_switch'] else 'OFF'}")
-        print(f"tun route:   {'up' if s['tun_route'] else 'down (blackholed)'}")
-        print(f"selected:    {s['selected'] or '?'}")
-        print(f"exit IP:     {e['ip']}  {e.get('city')}, {e.get('country')}  {e.get('org')}" if e
-              else "exit IP:     unreachable (no proxy selected, or proxy down)")
+        o = overview()
+        ips = exit_ips()
+        f = o["features"]
+        e = ips["proxy"] if o["egress"] == "proxy" else ips["direct"]
+        print(f"egress:      {o['egress']}" + (f" via {o['selected'] or '?'}" if o["egress"] == "proxy" else f" via {o['wan']}"))
+        print(f"exit IP:     {e['ip']}  {e.get('city')}, {e.get('country')}  {e.get('org')}" if e else "exit IP:     unreachable")
+        print(f"exit node:   {'on' if f['exit_node'] else 'off'}" + (f" (kill switch {'on' if f['kill_switch'] else 'OFF'})" if f["exit_node"] and o["egress"] == "proxy" else ""))
+        print(f"forwarding:  {'on' if o['health']['forwarding'] else 'off'}")
+        print(f"mihomo:      {o['health']['mihomo']}")
+        c = o["cliproxyapi"]
+        print(f"CLIProxyAPI: " + ("not installed" if not c["installed"] else f"{c['container'] or 'no container'}, proxy-url {c['proxy_url'] or '(direct)'}"))
+        print(f"firewall:    {'on' if f['firewall'] else 'OFF'}, {sum(p['access'] != 'public' for p in o['ports'])} restricted ports")
+        print_warnings(o["warnings"])
     elif cmd == "list":
-        v = proxies_view()
-        if not v["proxies"]:
+        now, proxies = selected(), load_state()["proxies"]
+        if not proxies:
             print("no proxies yet: proxyctl add NAME socks5://user:pass@host:port")
-        for p in v["proxies"]:
-            print(f"{'*' if p['name'] == v['now'] else ' '} {p['name']:<20} {p['type']} {p['server']}:{p['port']}")
-        if v["now"] == "REJECT":
+        for p in proxies:
+            print(f"{'*' if p['name'] == now else ' '} {p['name']:<20} {p['type']} {p['server']}:{p['port']}")
+        if now == "REJECT":
             print("* REJECT (everything blocked)")
     elif cmd == "add" and len(args) == 3:
         add_proxy(args[1], args[2])
@@ -567,17 +922,41 @@ def cli(args):
         use_proxy(args[1])
         print(f"switched to {args[1]}")
     elif cmd == "test":
-        for name, ms in test_all().items():
-            print(f"{name:<20} {f'{ms} ms' if ms else 'timeout'}")
-    elif cmd == "routing" and len(args) == 1:
-        print(f"routing: {'on' if load_state()['routing'] else 'off'}")
-    elif cmd == "routing" and args[1] == "on":
-        routing_on(force="--force" in args)
-        print("routing on: this VPS is advertised as an exit node")
-        print("first time? Tailscale admin console -> Machines -> this VPS -> Edit route settings -> Use as exit node")
-    elif cmd == "routing" and args[1] == "off":
-        routing_off()
-        print("routing off: exit node no longer advertised, VPS DNS restored")
+        for name, r in test_all().items():
+            result = f"{r['ms']} ms" if r["ms"] else f"failed: {r['error']}"
+            print(f"{name:<20} {result}")
+    elif cmd == "speed" and len(args) <= 2:
+        names = args[1:] or [p["name"] for p in load_state()["proxies"]] + ["DIRECT"]
+        for name in names:
+            r = speed_test(name)
+            result = (f"down {r['down_mbps']} Mbps, up {r.get('up_mbps') or '?'} Mbps, first byte {r['ttfb_ms']} ms"
+                      if "down_mbps" in r else "")
+            if r.get("error"):
+                result += ("  " if result else "") + f"failed: {r['error']}"
+            print(f"{name:<20} {result}")
+    elif cmd == "egress" and len(args) == 2:
+        print_warnings(set_settings({"egress": args[1]}))
+        print(f"egress: {args[1]}")
+    elif cmd in ("exit-node", "routing") and len(args) == 2:
+        print_warnings(set_settings({"exit_node": onoff(args[1])}))
+        print(f"exit node: {args[1]}")
+        if args[1] == "on":
+            print("first time? Tailscale admin console -> Machines -> this VPS -> Edit route settings -> Use as exit node")
+    elif cmd == "set" and len(args) == 3:
+        key = args[1].replace("-", "_")
+        if key not in FEATURES:
+            raise Err(f"unknown feature, choose from: {', '.join(k.replace('_', '-') for k in FEATURES)}")
+        print_warnings(set_settings({key: onoff(args[2])}))
+        print(f"{args[1]}: {args[2]}")
+    elif cmd == "ports":
+        for p in overview()["ports"]:
+            who = (p["process"] or "listening") + (" (localhost only)" if p["local_only"] else "") if p["listening"] else "-"
+            print(f"{p['port']:>5}/{p['proto']:<4} {p['access']:<10} {p['label']:<28} {who}")
+    elif cmd == "port" and len(args) == 3 and args[1] == "remove":
+        print_warnings(remove_port(args[2]))
+    elif cmd == "port" and len(args) >= 3:
+        print_warnings(set_port(args[1], args[2], " ".join(args[3:]) or None))
+        print(f"{args[1]}: {args[2]}")
     elif cmd == "forwarding":
         for key, val in fwd_values().items():
             print(f"{key} = {val}")
@@ -586,10 +965,26 @@ def cli(args):
         else:
             enable_forwarding()
             print(f"forwarding enabled (saved in {SYSCTL_FILE})")
+    elif cmd == "derp":
+        d = derp_info()
+        if not d["installed"]:
+            print("DERP relay not installed: sudo bash setup.sh --derp")
+        else:
+            print(f"derper: {d['service']}, https://{d['host'] or '?'}:{DERP_PORT}")
+            if d["acl"]:
+                print("\nPaste this into the Tailscale admin console -> Access controls, inside the top-level { }:\n")
+                print(d["acl"])
+            else:
+                print(f"no certificate in {DERP_DIR} yet: journalctl -u derper -n 30")
     elif cmd == "secret":
         print(load_state()["secret"] or "no secret yet: proxyctl init")
     elif cmd == "init":
         init()
+    elif cmd == "init-cliproxyapi":
+        init_cliproxyapi()
+    elif cmd == "apply":
+        with LOCK:
+            print_warnings(apply_net(load_state(), boot="--boot" in args))
     elif cmd == "serve":
         ThreadingHTTPServer(("0.0.0.0", PANEL_PORT), Panel).serve_forever()
     else:

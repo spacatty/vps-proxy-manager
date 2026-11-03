@@ -1,0 +1,701 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>proxyctl</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* Framed sheet: a blue-grey L-frame (sidebar + 48px top bar) holds a white sheet inset 8px right and bottom.
+   Grid: sheet content max 1120px, 24px padding, one 24px gap; two-column rows are 2fr + 1fr. */
+:root {
+  --frame: #edf1f4; --surface: #ffffff; --raised: #f4f6f8; --active: #e3e8ec;
+  --border: #e8eaec; --rule: #f0f1f2; --control: #cdced1;
+  --text: #131416; --muted: #5d5f60; --faint: #6b6b6b;
+  --primary: #1d1f20; --on-primary: #ffffff;
+  --accent: #1b6c80; --on-accent: #ffffff; --positive: #1e7b4f; --negative: #c4242a; --warning: #92400e;
+  --pill-positive-bg: #dcfae5; --pill-positive-ink: #04250e;
+  --pill-negative-bg: #ffedea; --pill-negative-ink: #831c1e;
+  --pill-warning-bg: #fffbeb; --pill-warning-ink: #92400e; --warning-line: #fde68a;
+  --pill-neutral-bg: #ebedee; --pill-neutral-ink: #353736;
+  --radius-card: 8px; --radius-control: 6px; --radius-sheet: 16px;
+  --gap: 24px; --pad: 24px; --control-height: 32px; --sidebar-width: 228px;
+  --font: "IBM Plex Sans", Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --frame: #0a0a0a; --surface: #121212; --raised: #1a1a1a; --active: #262626;
+    --border: #2a2a2a; --rule: #1f1f1f; --control: #444444;
+    --text: #ffffff; --muted: #b4b4b4; --faint: #949494;
+    --primary: #ffffff; --on-primary: #000000;
+    --accent: #5bb7cc; --on-accent: #000000; --positive: #3fc07a; --negative: #ef6a6f; --warning: #f0b35a;
+    --pill-positive-bg: #172a1d; --pill-positive-ink: #3fc07a;
+    --pill-negative-bg: #2c1a1c; --pill-negative-ink: #ef6a6f;
+    --pill-warning-bg: #2a2111; --pill-warning-ink: #f0b35a; --warning-line: #4a3a17;
+    --pill-neutral-bg: #262626; --pill-neutral-ink: #d4d4d4;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--frame); color: var(--text); font: 14px/20px var(--font); -webkit-font-smoothing: antialiased; }
+.num, .mono { font-variant-numeric: tabular-nums; }
+.mono { font-family: var(--mono); font-size: 13px; }
+.muted { color: var(--muted); }
+button, input, select { font: inherit; color: inherit; }
+a { color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* shell */
+.app { display: grid; grid-template-columns: var(--sidebar-width) 1fr; grid-template-rows: 48px 1fr; min-height: 100vh; }
+.side { grid-row: 1 / 3; display: flex; flex-direction: column; padding: 12px 12px 16px; gap: 2px; }
+.brand { display: flex; align-items: baseline; gap: 8px; padding: 2px 8px 18px; }
+.brand b { font-weight: 600; font-size: 15px; }
+.brand span { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav a { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 8px; border-radius: var(--radius-control);
+  text-decoration: none; color: var(--muted); }
+.nav a:hover { color: var(--text); }
+.nav a[aria-current="page"] { background: var(--active); color: var(--text); font-weight: 500; }
+.nav svg { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.5; }
+.nav .count { margin-left: auto; font-size: 12px; color: var(--muted); }
+.side-foot { margin-top: auto; padding: 0 8px; display: grid; gap: 6px; font-size: 12px; color: var(--muted); }
+.side-foot button { justify-self: start; background: none; border: 0; padding: 0; color: var(--muted); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.top { display: flex; align-items: center; gap: 12px; padding: 0 16px 0 0; }
+.top .where { display: none; font-weight: 600; }
+.top .fresh { margin-left: auto; color: var(--muted); font-size: 12px; }
+.sheet { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sheet);
+  margin: 0 8px 8px 0; min-height: calc(100vh - 56px); min-width: 0; }
+.content { padding: var(--pad); display: grid; gap: var(--gap); }
+.bottom-nav { display: none; }
+
+/* title row */
+.title { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.title > div:first-child { flex: 1 1 320px; min-width: 0; }
+h1 { font-size: 22px; line-height: 28px; font-weight: 600; margin: 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.lede { margin: 6px 0 0; color: var(--text); font-size: 14px; }
+h2 { font-size: 16px; line-height: 24px; font-weight: 600; margin: 0; }
+.card-head { display: flex; align-items: center; gap: 12px; padding: 16px 20px 0; }
+.card-head .link { margin-left: auto; }
+
+/* controls */
+.btn { height: var(--control-height); padding: 0 12px; border-radius: var(--radius-control); border: 1px solid var(--control);
+  background: var(--surface); cursor: pointer; white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; }
+.btn:hover { background: var(--raised); }
+.btn:active { transform: translateY(1px); }
+.btn.primary { background: var(--primary); border-color: var(--primary); color: var(--on-primary); }
+.btn.primary:hover { opacity: .9; }
+.btn.danger { color: var(--negative); }
+.btn.text { border-color: transparent; background: none; padding: 0 6px; }
+.btn.text:hover { background: var(--raised); }
+.btn:disabled { cursor: default; opacity: .55; }
+.link { color: var(--text); background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--control); }
+.seg { display: inline-flex; border: 1px solid var(--control); border-radius: var(--radius-control); padding: 2px; gap: 2px; height: var(--control-height); }
+.seg button { border: 0; background: none; border-radius: 4px; padding: 0 12px; cursor: pointer; color: var(--muted); }
+.seg button[aria-pressed="true"] { background: var(--active); color: var(--text); font-weight: 500; }
+input[type=text], input[type=password], input[type=number], select {
+  height: var(--control-height); border: 1px solid var(--control); border-radius: var(--radius-control); background: var(--surface);
+  padding: 0 10px; min-width: 0; }
+input::placeholder { color: var(--faint); }
+label.field { display: grid; gap: 6px; font-weight: 500; }
+label.field span { font-weight: 400; color: var(--muted); font-size: 12px; }
+.switch { position: relative; width: 32px; height: 18px; flex: none; }
+.switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.switch i { position: absolute; inset: 0; border-radius: 9px; background: var(--control); transition: background .15s; pointer-events: none; }
+.switch i::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform .15s; }
+.switch input:checked + i { background: var(--positive); }
+.switch input:checked + i::after { transform: translateX(14px); }
+.switch input:disabled + i { opacity: .45; }
+.switch input:focus-visible + i { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* surfaces */
+.card { border: 1px solid var(--border); border-radius: var(--radius-card); background: var(--surface); min-width: 0; }
+.row2 { display: grid; grid-template-columns: 2fr 1fr; gap: var(--gap); align-items: start; }
+.pill { display: inline-flex; align-items: center; height: 20px; padding: 0 8px; border-radius: 999px; font-size: 12px; font-weight: 500;
+  white-space: nowrap; flex: none; background: var(--pill-neutral-bg); color: var(--pill-neutral-ink); }
+.pill.ok { background: var(--pill-positive-bg); color: var(--pill-positive-ink); }
+.pill.bad { background: var(--pill-negative-bg); color: var(--pill-negative-ink); }
+.pill.warn { background: var(--pill-warning-bg); color: var(--pill-warning-ink); }
+.notice { border: 1px solid var(--warning-line); background: var(--pill-warning-bg); color: var(--pill-warning-ink);
+  border-radius: var(--radius-card); padding: 10px 14px; font-size: 13px; display: grid; gap: 4px; }
+.flash { min-height: 20px; margin: -8px 0 -8px; font-size: 13px; }
+.flash.bad { color: var(--negative); }
+.flash.ok { color: var(--positive); }
+
+/* the egress path: the screen's signature element */
+.paths { padding: 8px 20px 4px; }
+.path { display: grid; grid-template-columns: 150px 1fr auto; align-items: center; gap: 16px; min-height: 56px; border-top: 1px solid var(--rule); }
+.path:first-child { border-top: 0; }
+.path .who { font-weight: 500; }
+.path .who small { display: block; font-weight: 400; color: var(--muted); font-size: 12px; line-height: 16px; }
+.chain { display: flex; align-items: center; flex-wrap: wrap; row-gap: 6px; min-width: 0; }
+.hop { padding: 2px 8px; border-radius: 4px; background: var(--raised); white-space: nowrap; font-size: 13px; }
+.hop.main { background: var(--accent); color: var(--on-accent); }
+.hop.blocked { background: var(--pill-negative-bg); color: var(--pill-negative-ink); }
+.chain .line { width: 20px; height: 1px; background: var(--control); flex: none; }
+.path .out { text-align: right; }
+.path .out small { display: block; color: var(--muted); font-size: 12px; line-height: 16px; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.path.off { color: var(--muted); }
+.path.off .who { color: var(--muted); }
+
+/* KPI strip: one card split by dividers */
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); }
+.kpi { padding: 16px 20px; border-left: 1px solid var(--border); min-width: 0; }
+.kpi:first-child { border-left: 0; }
+.kpi span { display: block; color: var(--muted); font-size: 12px; }
+.kpi b { display: block; font-size: 22px; line-height: 30px; font-weight: 400; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kpi b.mono { font-size: 18px; }
+.kpi small { color: var(--muted); font-size: 12px; }
+
+/* tables */
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; font-weight: 400; color: var(--muted); font-size: 12px; height: 36px; padding: 0 12px; white-space: nowrap; }
+td { height: 48px; padding: 6px 12px; border-top: 1px solid var(--rule); vertical-align: middle; }
+th:first-child, td:first-child { padding-left: 20px; }
+th:last-child, td:last-child { padding-right: 20px; }
+td.num, th.num { text-align: right; }
+td.actions { text-align: right; white-space: nowrap; }
+td .sub { display: none; color: var(--muted); font-size: 12px; line-height: 16px; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 8px; vertical-align: 1px; }
+.dot.idle { background: transparent; border: 1px solid var(--control); }
+.empty { margin: 8px 20px 16px; border: 1px dashed var(--control); border-radius: var(--radius-card); padding: 10px 14px; color: var(--muted); }
+.form-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: end; padding: 16px 20px 20px; }
+.form-row .grow { flex: 1 1 260px; }
+.form-row label.field { flex: 0 1 auto; }
+.form-row label.field input, .form-row label.field select { width: 100%; }
+
+/* key-value (CLIProxyAPI) */
+.kv { display: grid; gap: 14px; padding: 12px 20px 20px; }
+.kv div > span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+.copyline { display: flex; min-width: 0; }
+.copyline code { flex: 1; min-width: 0; font-family: var(--mono); font-size: 12.5px; padding: 6px 8px; background: var(--raised);
+  border: 1px solid var(--border); border-right: 0; border-radius: var(--radius-control) 0 0 var(--radius-control);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.copyline .btn { border-radius: 0 var(--radius-control) var(--radius-control) 0; height: auto; }
+
+.snippet { margin: 10px 0; padding: 10px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-control);
+  font-size: 12px; line-height: 17px; overflow-x: auto; white-space: pre; }
+
+/* settings */
+.set { display: grid; grid-template-columns: 300px 1fr; gap: var(--gap); padding: 24px 0; border-top: 1px solid var(--border); }
+.set:first-of-type { border-top: 0; padding-top: 0; }
+.set > div:first-child h2 { font-size: 15px; }
+.set > div:first-child p { margin: 4px 0 0; color: var(--muted); }
+.panel { background: var(--raised); border-radius: var(--radius-card); padding: 4px 16px; }
+.opt { display: flex; gap: 16px; align-items: flex-start; padding: 14px 0; border-top: 1px solid var(--border); }
+.opt:first-child { border-top: 0; }
+.opt > div { flex: 1; min-width: 0; }
+.opt b { font-weight: 500; }
+.opt p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+.opt .stamp { font-size: 12px; color: var(--positive); margin-left: 8px; font-weight: 400; }
+.choice { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 12px 0; }
+.choice button { text-align: left; border: 1px solid var(--control); background: var(--surface); border-radius: var(--radius-card); padding: 12px 14px; cursor: pointer; }
+.choice button b { display: block; font-weight: 500; }
+.choice button span { display: block; color: var(--muted); font-size: 13px; margin-top: 2px; }
+.choice button[aria-pressed="true"] { border-color: var(--text); outline: 1px solid var(--text); outline-offset: -2px; }
+
+/* loading: flat bars at the size of the value */
+.skel { display: inline-block; height: 14px; width: 90px; border-radius: 3px; background: var(--active); vertical-align: middle; }
+
+/* sign in */
+.signin { max-width: 380px; margin: 12vh auto 0; display: grid; gap: 16px; }
+.signin p { margin: 0; color: var(--muted); }
+
+/* tablet and phone */
+@media (max-width: 1100px) {
+  .row2 { grid-template-columns: 1fr; }
+  .hide-sm { display: none; }
+  td .sub { display: block; }
+  .set { grid-template-columns: 1fr; gap: 12px; }
+}
+@media (max-width: 760px) {
+  .app { grid-template-columns: 1fr; grid-template-rows: 48px 1fr; }
+  .side { display: none; }
+  .top { padding: 0 16px; background: var(--frame); position: sticky; top: 0; z-index: 2; }
+  .top .where { display: block; }
+  .sheet { margin: 0; border: 0; border-radius: 0; min-height: calc(100vh - 48px); padding-bottom: 64px; }
+  .content { padding: 16px; gap: 16px; }
+  .bottom-nav { display: grid; grid-template-columns: repeat(4, 1fr); position: fixed; left: 0; right: 0; bottom: 0; height: 56px;
+    background: var(--frame); border-top: 1px solid var(--border); z-index: 3; }
+  .bottom-nav a { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-size: 11px;
+    text-decoration: none; color: var(--muted); }
+  .bottom-nav a[aria-current="page"] { color: var(--text); font-weight: 500; }
+  .bottom-nav svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.5; }
+  .title .seg { width: 100%; }
+  .title .seg button { flex: 1; }
+  .kpis { grid-template-columns: 1fr 1fr; }
+  .kpi:nth-child(3) { border-left: 0; }
+  .kpi:nth-child(n+3) { border-top: 1px solid var(--border); }
+  .path { grid-template-columns: 1fr auto; gap: 6px 12px; padding: 12px 0; }
+  .path .chain { grid-column: 1 / -1; grid-row: 2; }
+  .path .out { grid-column: 2; grid-row: 1; }
+  td { height: 56px; }
+  th:first-child, td:first-child { padding-left: 16px; }
+  th:last-child, td:last-child { padding-right: 16px; }
+  .card-head { padding: 14px 16px 0; }
+  .paths, .kv { padding-left: 16px; padding-right: 16px; }
+  .form-row { padding: 14px 16px 16px; }
+  .form-row label.field, .form-row .grow { flex: 1 1 100%; }
+  .choice { grid-template-columns: 1fr; }
+  .btn, .seg { min-height: 40px; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand"><b>proxyctl</b><span id="host-side"></span></div>
+    <nav class="nav" id="nav"></nav>
+    <div class="side-foot">
+      <span id="ts-side"></span>
+      <button type="button" id="signout">Sign out</button>
+    </div>
+  </aside>
+  <header class="top">
+    <span class="where" id="where">proxyctl</span>
+    <span class="fresh" id="fresh"></span>
+    <button class="btn" type="button" id="refresh">Refresh</button>
+  </header>
+  <main class="sheet"><div class="content" id="view"></div></main>
+</div>
+<nav class="bottom-nav" id="bnav"></nav>
+
+<script>
+'use strict';
+const VIEWS = [
+  { id: 'overview', label: 'Overview', icon: '<path d="M3 12h4l3-8 4 16 3-8h4"/>' },
+  { id: 'proxies', label: 'Proxies', icon: '<circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8.3 11 15.7 7M8.3 13l7.4 4"/>' },
+  { id: 'ports', label: 'Ports', icon: '<rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>' },
+  { id: 'settings', label: 'Settings', icon: '<path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>' },
+];
+let SECRET = '';
+try { SECRET = localStorage.getItem('proxyctl-secret') || ''; } catch (e) {}
+let S = null;          // /api/state
+let EXIT = null;       // /api/exit: {proxy, direct}, undefined while checking
+let FLASH = null;      // {text, bad}
+let BUSY = false;
+let SPEEDING = null;   // name of the proxy whose speed test is running
+const SAVED = {};      // setting key -> time of the last save, for the "Saved" stamp
+const DRAFT = {};      // form field id -> typed value, so re-renders never wipe what you typed
+
+// --- helpers -----------------------------------------------------------------
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k === 'text') el.textContent = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid.nodeType ? kid : String(kid));
+  return el;
+}
+function svg(paths) {
+  const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  s.setAttribute('viewBox', '0 0 24 24'); s.setAttribute('aria-hidden', 'true'); s.innerHTML = paths; return s;
+}
+// a form control that keeps its typed value in DRAFT across re-renders
+function field(tag, attrs, ...kids) {
+  const el = h(tag, attrs, ...kids);
+  if (attrs.id in DRAFT) el.value = DRAFT[attrs.id];
+  el.addEventListener(tag === 'select' ? 'change' : 'input', () => { DRAFT[attrs.id] = el.value; });
+  return el;
+}
+function clearDraft(...ids) { ids.forEach(id => delete DRAFT[id]); }
+const pill = (text, kind) => h('span', { class: 'pill' + (kind ? ' ' + kind : ''), text });
+const skel = (w) => h('span', { class: 'skel', style: `width:${w || 90}px` });
+const place = (ip) => ip ? [ip.city, ip.country].filter(Boolean).join(', ') : '';
+const org = (ip) => ip && ip.org ? ip.org.replace(/^AS\d+\s+/, '') : '';
+function ago(t) { const d = new Date(t * 1000); return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
+
+async function call(method, path, body) {
+  const r = await fetch('/api/' + path, { method, headers: { Authorization: 'Bearer ' + SECRET, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined });
+  const d = await r.json().catch(() => ({}));
+  if (r.status === 401) { SECRET = ''; render(); throw new Error('Wrong secret'); }
+  if (!r.ok) throw new Error(d.error || r.statusText);
+  return d;
+}
+function flash(text, bad) { FLASH = { text, bad }; render(); }
+async function act(fn, done) {
+  if (BUSY) return;
+  BUSY = true; render();
+  try {
+    const d = await fn();
+    if (d && d.host) S = d;
+    const warn = d && d.applied && d.applied.length ? ' ' + d.applied.join(' ') : '';
+    FLASH = done ? { text: done + warn, bad: !!warn } : (warn ? { text: warn.trim(), bad: true } : null);
+  } catch (e) { FLASH = { text: e.message, bad: true }; }
+  BUSY = false; render();
+}
+function copy(text, btn) {
+  const done = () => { const t = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => { btn.textContent = t; }, 1200); };
+  if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(text).then(done); return; }
+  const ta = h('textarea', { style: 'position:fixed;opacity:0' }); ta.value = text; document.body.append(ta); ta.select();
+  try { document.execCommand('copy'); done(); } catch (e) {} ta.remove();
+}
+
+async function load() {
+  try { S = await call('GET', 'state'); } catch (e) { if (SECRET) FLASH = { text: e.message, bad: true }; }
+  render();
+}
+async function loadExit() {
+  EXIT = undefined; render();
+  try { EXIT = await call('GET', 'exit'); } catch (e) { EXIT = { proxy: null, direct: null }; }
+  render();
+}
+
+// --- derived facts (each computed once, used everywhere) ----------------------
+function facts() {
+  const f = S.features, proxied = S.egress === 'proxy';
+  const sel = S.selected && S.selected !== 'REJECT' ? S.proxies.find(p => p.name === S.selected) : null;
+  const ip = EXIT ? (proxied ? EXIT.proxy : EXIT.direct) : undefined;     // undefined = checking, null = failed
+  const blocked = proxied && (!sel || S.health.mihomo !== 'active' || ip === null);
+  const lat = sel && S.latency[sel.name];
+  const restricted = S.ports.filter(p => p.access !== 'public').length;
+  return { f, proxied, sel, ip, blocked, lat, restricted };
+}
+
+// --- views --------------------------------------------------------------------
+function titleRow(title, extra, lede, right) {
+  return h('div', { class: 'title' },
+    h('div', {}, h('h1', {}, title, extra), lede ? h('p', { class: 'lede' }, lede) : null),
+    right);
+}
+function egressSeg() {
+  const set = (egress) => act(() => call('POST', 'settings', { egress }), egress === 'proxy' ? 'Traffic now goes through the proxy.' : 'Traffic now leaves directly from the VPS.').then(loadExit);
+  return h('div', { class: 'seg', role: 'group', 'aria-label': 'Egress' },
+    h('button', { type: 'button', 'aria-pressed': String(S.egress === 'proxy'), disabled: BUSY, onclick: () => S.egress !== 'proxy' && set('proxy') }, 'Via proxy'),
+    h('button', { type: 'button', 'aria-pressed': String(S.egress === 'direct'), disabled: BUSY, onclick: () => S.egress !== 'direct' && set('direct') }, 'Direct'));
+}
+function notices() {
+  if (!S.warnings.length) return null;
+  return h('div', { class: 'notice', role: 'status' }, S.warnings.map(w => h('div', { text: w })),
+    h('div', {}, h('button', { class: 'link', type: 'button', disabled: BUSY, style: 'color:inherit',
+      onclick: () => act(() => call('POST', 'apply'), 'Settings applied.').then(loadExit) }, 'Apply settings again')));
+}
+function flashLine() { return FLASH ? h('p', { class: 'flash ' + (FLASH.bad ? 'bad' : 'ok'), role: 'status', text: FLASH.text }) : null; }
+
+function overviewView() {
+  const { f, proxied, sel, ip, blocked, lat, restricted } = facts();
+  const status = proxied ? (blocked ? pill('Blocked', 'bad') : pill('Via proxy', 'ok')) : pill('Direct');
+  let lede;
+  if (proxied && !sel) lede = 'No proxy is selected, so proxied traffic is blocked.';
+  else if (ip === undefined) lede = 'Checking where traffic leaves…';
+  else if (proxied && ip === null) lede = `${sel.name} didn't answer the IP check, so proxied traffic is blocked.`;
+  else if (ip === null) lede = 'The VPS could not reach the internet for the IP check.';
+  else lede = proxied ? `Traffic leaves through ${sel.name} as ${ip.ip}${org(ip) ? ', ' + org(ip) : ''}${place(ip) ? ', ' + place(ip) : ''}.`
+                      : `Traffic leaves directly from ${S.wan || 'the VPS'} as ${ip.ip}${org(ip) ? ', ' + org(ip) : ''}.`;
+
+  // the egress path per consumer
+  const proxyHops = () => sel
+    ? [h('span', { class: 'hop' }, 'mihomo'), h('span', { class: 'line' }), h('span', { class: 'hop main' }, sel.name)]
+    : [h('span', { class: 'hop' }, 'mihomo'), h('span', { class: 'line' }), h('span', { class: 'hop blocked' }, 'REJECT')];
+  const directHops = () => [h('span', { class: 'hop' }, S.wan || 'WAN')];
+  const outCell = (via) => {
+    const x = EXIT ? EXIT[via] : undefined;
+    if (via === 'proxy' && !sel) return h('div', { class: 'out' }, h('span', { class: 'muted', text: 'Blocked' }));
+    if (x === undefined) return h('div', { class: 'out' }, skel(110));
+    if (x === null) return h('div', { class: 'out' }, h('span', { class: 'muted', text: 'No answer' }));
+    return h('div', { class: 'out' }, h('span', { class: 'mono', text: x.ip }), h('small', { text: org(x) || place(x) }));
+  };
+  const cpa = S.cliproxyapi;
+  const rows = [
+    { who: 'CLIProxyAPI', sub: cpa.installed ? (cpa.container || 'no container') : 'not installed',
+      on: f.cliproxyapi && cpa.installed, off: cpa.installed ? 'Proxy setting not managed here' : 'Not installed' },
+    { who: 'Exit-node clients', sub: 'Tailscale devices', on: f.exit_node, off: 'Exit node is off' },
+  ].map(r => h('div', { class: 'path' + (r.on ? '' : ' off') },
+      h('div', { class: 'who' }, r.who, h('small', { text: r.sub })),
+      r.on ? h('div', { class: 'chain' }, proxied ? proxyHops() : directHops()) : h('div', { class: 'chain muted', text: r.off }),
+      r.on ? outCell(proxied ? 'proxy' : 'direct') : h('div')));
+  rows.push(h('div', { class: 'path' },
+    h('div', { class: 'who' }, 'This VPS', h('small', { text: 'apt, SSH, its own traffic' })),
+    h('div', { class: 'chain' }, directHops()),
+    outCell('direct')));
+
+  const kpis = h('div', { class: 'card kpis' },
+    h('div', { class: 'kpi' }, h('span', { text: 'Selected proxy' }), h('b', { text: sel ? sel.name : '—' }), h('small', { text: sel ? `${sel.type} ${sel.server}:${sel.port}` : 'none selected' })),
+    h('div', { class: 'kpi' }, h('span', { text: 'Latency' }), h('b', { class: 'num', text: lat && lat.ms ? `${lat.ms.toLocaleString()} ms` : '—' }),
+      h('small', { text: lat ? (lat.ms ? `tested at ${ago(lat.at)}` : (lat.error || 'failed')) : 'not tested yet' })),
+    h('div', { class: 'kpi' }, h('span', { text: 'Proxies' }), h('b', { class: 'num', text: String(S.proxies.length) }), h('small', { text: S.proxies.length ? 'in the switch list' : 'add one to start' })),
+    h('div', { class: 'kpi' }, h('span', { text: 'Restricted ports' }), h('b', { class: 'num', text: `${restricted} of ${S.ports.length}` }),
+      h('small', { text: f.firewall ? 'firewall on' : 'firewall rules off' })));
+
+  return [
+    titleRow(S.host, status, lede, egressSeg()),
+    flashLine(), notices(),
+    h('section', { class: 'card', 'aria-labelledby': 'h-paths' },
+      h('div', { class: 'card-head' }, h('h2', { id: 'h-paths', text: 'Where traffic leaves' }),
+        h('button', { class: 'link', type: 'button', onclick: loadExit, disabled: EXIT === undefined }, 'Check again')),
+      h('div', { class: 'paths' }, rows)),
+    kpis,
+    h('div', { class: 'row2' }, proxiesCard(5), cpaCard()),
+  ];
+}
+
+function proxiesCard(limit) {
+  const list = limit ? S.proxies.slice(0, limit) : S.proxies;
+  const body = S.proxies.length ? h('table', {},
+    h('thead', {}, h('tr', {}, h('th', { text: 'Name' }), h('th', { class: 'hide-sm', text: 'Address' }), h('th', { class: 'num hide-sm', text: 'Latency' }), h('th', { class: 'num', text: '' }))),
+    h('tbody', {}, list.map(p => {
+      const active = p.name === S.selected, lat = S.latency[p.name];
+      const latText = lat ? (lat.ms ? `${lat.ms.toLocaleString()} ms` : (lat.error || 'failed')) : '—';
+      return h('tr', {},
+        h('td', {}, h('span', { class: 'dot' + (active ? '' : ' idle'), title: active ? 'In use' : '' }), h('b', { style: 'font-weight:500', text: p.name }),
+          h('div', { class: 'sub mono', text: `${p.server}:${p.port} · ${latText}` })),
+        h('td', { class: 'mono hide-sm' }, `${p.type} ${p.server}:${p.port}`, p.auth ? h('span', { class: 'muted', text: ' · auth' }) : null),
+        h('td', { class: 'num hide-sm' + (lat && !lat.ms ? ' muted' : '') , text: latText }),
+        h('td', { class: 'actions' },
+          active ? h('span', { class: 'muted', text: 'In use' }) :
+            h('button', { class: 'btn', type: 'button', disabled: BUSY, onclick: () => act(() => call('PUT', 'select', { name: p.name }), `Switched to ${p.name}.`).then(loadExit) }, 'Use'),
+          limit ? null : h('button', { class: 'btn text', type: 'button', disabled: BUSY, onclick: () => {
+            if (confirm(`Remove ${p.name}? mihomo restarts and connections drop for a second.`)) act(() => call('DELETE', 'proxies/' + encodeURIComponent(p.name)), `Removed ${p.name}.`).then(loadExit);
+          } }, 'Remove')));
+    })))
+    : h('div', { class: 'empty' }, 'No proxies yet. ', h('a', { href: '#proxies', text: 'Add one' }), ' to start sending traffic through it.');
+  return h('section', { class: 'card', 'aria-labelledby': 'h-prox' + (limit ? 's' : '') },
+    h('div', { class: 'card-head' }, h('h2', { id: 'h-prox' + (limit ? 's' : ''), text: limit ? 'Proxies' : `${S.proxies.length} ${S.proxies.length === 1 ? 'proxy' : 'proxies'}` }),
+      limit && S.proxies.length > limit ? h('a', { class: 'link', href: '#proxies', text: `View all ${S.proxies.length}` }) :
+      limit ? h('a', { class: 'link', href: '#proxies', text: 'Manage' }) : null),
+    h('div', { class: 'scroll', style: 'padding-top:8px' }, body));
+}
+
+function cpaCard() {
+  const c = S.cliproxyapi, f = S.features;
+  if (!c.installed) return h('section', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', { text: 'CLIProxyAPI' }), pill('Not installed')),
+    h('div', { class: 'kv' }, h('p', { class: 'muted', style: 'margin:0', text: 'Re-run setup.sh without --no-cliproxyapi to install it in /opt/CLIProxyAPI.' })));
+  const running = c.container === 'running';
+  const line = (label, value, secret) => {
+    let shown = !secret;
+    const code = h('code', { text: secret ? '•'.repeat(18) : value });
+    const btns = [];
+    if (secret) btns.push(h('button', { class: 'btn', type: 'button', onclick: (e) => { shown = !shown; code.textContent = shown ? value : '•'.repeat(18); e.target.textContent = shown ? 'Hide' : 'Show'; } }, 'Show'));
+    btns.push(h('button', { class: 'btn', type: 'button', onclick: (e) => copy(value, e.target) }, 'Copy'));
+    return h('div', {}, h('span', { text: label }), h('div', { class: 'copyline' }, code, btns));
+  };
+  return h('section', { class: 'card', 'aria-labelledby': 'h-cpa' },
+    h('div', { class: 'card-head' }, h('h2', { id: 'h-cpa', text: 'CLIProxyAPI' }), running ? pill('Running', 'ok') : pill(c.container || 'Stopped', 'bad')),
+    h('div', { class: 'kv' },
+      line('API endpoint', c.endpoint),
+      c.keys.api ? line('API key', c.keys.api, true) : h('div', {}, h('span', { text: 'API key' }), h('span', { class: 'muted', text: 'Set in /opt/CLIProxyAPI/config.yaml' })),
+      c.keys.management ? line('Management key', c.keys.management, true) : null,
+      h('div', {}, h('span', { text: 'Requests go' }), f.cliproxyapi ? (c.proxy_url ? h('span', {}, 'through the proxy, ', h('span', { class: 'mono', text: c.proxy_url })) : h('span', { text: 'directly from the VPS' }))
+        : h('span', { class: 'muted', text: `proxy-url managed by hand (${c.proxy_url || 'direct'})` })),
+      h('a', { class: 'link', href: c.management, target: '_blank', rel: 'noopener', text: 'Open the management panel' })));
+}
+
+async function runSpeed(name) {
+  if (SPEEDING) return;
+  SPEEDING = name; FLASH = null; render();
+  try {
+    const r = await call('POST', 'speedtest', { name });
+    S.speed = { ...S.speed, [name]: r };
+    if (r.error) FLASH = { text: `${name === 'DIRECT' ? 'VPS' : name}: ${r.error}`, bad: true };
+  } catch (e) { FLASH = { text: e.message, bad: true }; }
+  SPEEDING = null; render();
+}
+function speedCard() {
+  const mbps = (v) => v == null ? '—' : `${v.toLocaleString(undefined, { maximumFractionDigits: v < 10 ? 1 : 0 })} Mbps`;
+  const rows = [...S.proxies.map(p => ({ name: p.name, label: p.name, sub: `${p.server}:${p.port}` })),
+    { name: 'DIRECT', label: 'This VPS', sub: `direct from ${S.wan || 'WAN'}, for comparison` }];
+  const sp = S.speed || {};
+  return h('section', { class: 'card', 'aria-labelledby': 'h-speed' },
+    h('div', { class: 'card-head' }, h('h2', { id: 'h-speed', text: 'Speed test' })),
+    h('p', { class: 'muted', style: 'margin:4px 20px 0;font-size:13px',
+      text: 'Downloads up to 25 MB and uploads 10 MB through each proxy straight from the VPS (about 30 s each). The hop from your device to the VPS over Tailscale is not included.' }),
+    h('div', { class: 'scroll', style: 'padding-top:8px' }, h('table', {},
+      h('thead', {}, h('tr', {}, h('th', { text: 'Route' }), h('th', { class: 'num', text: 'Download' }), h('th', { class: 'num', text: 'Upload' }),
+        h('th', { class: 'num hide-sm', text: 'First byte' }), h('th', { text: '' }))),
+      h('tbody', {}, rows.map(r => {
+        const x = sp[r.name], running = SPEEDING === r.name;
+        const cell = (v) => running ? skel(70) : (x ? v : '—');
+        return h('tr', {},
+          h('td', {}, h('b', { style: 'font-weight:500', text: r.label }),
+            h('div', { class: 'muted', style: 'font-size:12px;line-height:16px', text: x && x.error && !running ? x.error : (x && !running ? `${r.sub} · tested at ${ago(x.at)}` : r.sub) })),
+          h('td', { class: 'num' }, cell(mbps(x && x.down_mbps))),
+          h('td', { class: 'num' }, cell(mbps(x && x.up_mbps))),
+          h('td', { class: 'num hide-sm' }, cell(x && x.ttfb_ms != null ? `${x.ttfb_ms.toLocaleString()} ms` : '—')),
+          h('td', { class: 'actions' }, h('button', { class: 'btn', type: 'button', disabled: !!SPEEDING, onclick: () => runSpeed(r.name) },
+            running ? 'Testing…' : x ? 'Test again' : 'Test')));
+      })))));
+}
+
+function proxiesView() {
+  const name = field('input', { type: 'text', id: 'p-name', placeholder: 'isp-1', autocomplete: 'off', spellcheck: 'false' });
+  const spec = field('input', { type: 'text', id: 'p-spec', placeholder: 'socks5://user:pass@203.0.113.10:1080', autocomplete: 'off', spellcheck: 'false' });
+  const add = (e) => {
+    e.preventDefault();
+    const n = name.value.trim(), s = spec.value.trim();
+    if (!n || !s) return flash('Fill in a name and the proxy.', true);
+    act(() => call('POST', 'proxies', { name: n, proxy: s }), `Added ${n}.`).then(() => { if (!FLASH || !FLASH.bad) { clearDraft('p-name', 'p-spec'); render(); } loadExit(); });
+  };
+  return [
+    titleRow('Proxies', null, 'The selected proxy carries CLIProxyAPI and exit-node traffic while egress is set to Via proxy.',
+      h('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' },
+        h('button', { class: 'btn', type: 'button', disabled: BUSY || !S.proxies.length, onclick: () => act(async () => { S.latency = await call('GET', 'test'); }, 'Latency updated.') }, 'Test latency'),
+        h('button', { class: 'btn', type: 'button', disabled: BUSY || S.selected === 'REJECT', onclick: () => act(() => call('PUT', 'select', { name: 'REJECT' }), 'Proxied traffic is now blocked.').then(loadExit) }, 'Block all'))),
+    flashLine(),
+    h('section', { class: 'card', 'aria-labelledby': 'h-add' },
+      h('div', { class: 'card-head' }, h('h2', { id: 'h-add', text: 'Add a proxy' })),
+      h('form', { class: 'form-row', onsubmit: add },
+        h('label', { class: 'field', for: 'p-name', style: 'flex:0 1 180px' }, 'Name', name),
+        h('label', { class: 'field grow', for: 'p-spec' }, h('div', {}, 'Proxy ', h('span', { text: 'socks5://, http:// or host:port:user:pass' })), spec),
+        h('button', { class: 'btn primary', type: 'submit', disabled: BUSY }, BUSY ? 'Adding…' : 'Add proxy'))),
+    proxiesCard(0),
+    speedCard(),
+  ];
+}
+
+function portsView() {
+  const f = S.features;
+  const accessSel = (p) => h('select', { 'aria-label': `Access for ${p.port}/${p.proto}`, disabled: BUSY,
+    onchange: (e) => act(() => call('POST', 'ports', { port: p.port, proto: p.proto, access: e.target.value }), `${p.port}/${p.proto} is now ${labelOf(e.target.value).toLowerCase()}.`) },
+    ['tailscale', 'public', 'closed'].map(a => h('option', { value: a, selected: a === p.access,
+      disabled: a === 'closed' && p.port === S.panel_port && p.proto === 'tcp' }, labelOf(a))));
+  const listen = (p) => p.listening ? `${p.process || 'listening'}${p.local_only ? ', localhost only' : ''}` : 'idle';
+  const port = field('input', { type: 'number', id: 'n-port', min: 1, max: 65535, placeholder: '8080', style: 'width:110px' });
+  const proto = field('select', { id: 'n-proto' }, h('option', { value: 'tcp' }, 'TCP'), h('option', { value: 'udp' }, 'UDP'));
+  const access = field('select', { id: 'n-access' }, ['tailscale', 'public', 'closed'].map(a => h('option', { value: a }, labelOf(a))));
+  const label = field('input', { type: 'text', id: 'n-label', placeholder: 'What runs there', maxlength: 40 });
+  const add = (e) => {
+    e.preventDefault();
+    if (!port.value) return flash('Enter a port number.', true);
+    act(() => call('POST', 'ports', { port: port.value, proto: proto.value, access: access.value, label: label.value.trim() }), `Rule for ${port.value}/${proto.value} saved.`).then(() => { if (!FLASH || !FLASH.bad) { clearDraft('n-port', 'n-label'); render(); } });
+  };
+  return [
+    titleRow('Ports', f.firewall ? pill('Firewall on', 'ok') : pill('Firewall off', 'bad'),
+      'Rules for traffic arriving at this VPS. Tailscale only: reachable from your tailnet. Closed: only from the VPS itself. Ports not listed are left as they are.'),
+    flashLine(),
+    f.firewall ? null : h('div', { class: 'notice' }, 'Firewall rules are off, so none of these rules are enforced. Turn them on in Settings.'),
+    h('section', { class: 'card', 'aria-labelledby': 'h-ports' },
+      h('div', { class: 'card-head' }, h('h2', { id: 'h-ports', text: `${S.ports.length} port rules` })),
+      h('div', { class: 'scroll', style: 'padding-top:8px' }, S.ports.length ? h('table', {},
+        h('thead', {}, h('tr', {}, h('th', { text: 'Port' }), h('th', { class: 'hide-sm', text: 'Label' }), h('th', { class: 'hide-sm', text: 'Listening' }), h('th', { text: 'Access' }), h('th', { text: '' }))),
+        h('tbody', {}, S.ports.map(p => h('tr', {},
+          h('td', {}, h('span', { class: 'mono', text: `${p.port}/${p.proto}` }), h('div', { class: 'sub', text: [p.label, listen(p)].filter(Boolean).join(' · ') })),
+          h('td', { class: 'hide-sm', text: p.label || '—' }),
+          h('td', { class: 'hide-sm' + (p.listening ? '' : ' muted'), text: listen(p) }),
+          h('td', {}, accessSel(p)),
+          h('td', { class: 'actions' }, h('button', { class: 'btn text', type: 'button', disabled: BUSY,
+            onclick: () => confirm(`Remove the rule for ${p.port}/${p.proto}? The port becomes public.`) && act(() => call('DELETE', `ports/${p.port}/${p.proto}`), `Rule for ${p.port}/${p.proto} removed.`) }, 'Remove'))))))
+        : h('div', { class: 'empty' }, 'No port rules. Every port is left as the system has it.'))),
+    h('section', { class: 'card', 'aria-labelledby': 'h-newport' },
+      h('div', { class: 'card-head' }, h('h2', { id: 'h-newport', text: 'Add or change a rule' })),
+      h('form', { class: 'form-row', onsubmit: add },
+        h('label', { class: 'field', for: 'n-port' }, 'Port', port),
+        h('label', { class: 'field', for: 'n-proto' }, 'Protocol', proto),
+        h('label', { class: 'field', for: 'n-access' }, 'Access', access),
+        h('label', { class: 'field grow', for: 'n-label' }, 'Label', label),
+        h('button', { class: 'btn primary', type: 'submit', disabled: BUSY }, 'Save rule'))),
+  ];
+}
+function labelOf(a) { return { tailscale: 'Tailscale only', public: 'Public', closed: 'Closed' }[a]; }
+
+function settingsView() {
+  const f = S.features, proxied = S.egress === 'proxy';
+  const save = (key, value, text) => act(() => call('POST', 'settings', { [key]: value }), text).then(() => { SAVED[key] = Date.now(); render(); if (key === 'egress') loadExit(); });
+  const stamp = (key) => SAVED[key] && Date.now() - SAVED[key] < 4000 ? h('span', { class: 'stamp', text: 'Saved' }) : null;
+  const toggle = (key, title, desc, opts = {}) => h('div', { class: 'opt' },
+    h('div', {}, h('b', { text: title }), stamp(key), h('p', { text: opts.disabledWhy || desc })),
+    h('label', { class: 'switch' }, h('input', { type: 'checkbox', role: 'switch', checked: f[key], disabled: BUSY || !!opts.disabledWhy, 'aria-label': title,
+      onchange: (e) => save(key, e.target.checked) }), h('i')));
+  const choice = (value, title, desc) => h('button', { type: 'button', 'aria-pressed': String(S.egress === value), disabled: BUSY,
+    onclick: () => S.egress !== value && save('egress', value) }, h('b', { text: title }), h('span', { text: desc }));
+  const section = (title, desc, ...body) => h('div', { class: 'set' }, h('div', {}, h('h2', { text: title }), h('p', { text: desc })), h('div', { class: 'panel' }, body));
+  return [
+    titleRow('Settings', null, 'Every change applies at once and survives reboots.'),
+    flashLine(),
+    h('div', {},
+      section('Egress', 'Where CLIProxyAPI and exit-node traffic leaves the VPS.',
+        h('div', { class: 'choice' },
+          choice('proxy', 'Via proxy', 'Through the selected proxy. Nothing leaks out of the datacenter IP.'),
+          choice('direct', 'Direct', 'Straight out of the VPS’s own interface and IP.')), stamp('egress')),
+      section('Tailscale exit node', 'Let your devices send all their traffic through this VPS.',
+        toggle('exit_node', 'Advertise as exit node', 'Turns on IP forwarding. The first time, also allow it in the Tailscale admin console under Edit route settings.'),
+        toggle('kill_switch', 'Kill switch', 'If the proxy or mihomo stops, exit-node traffic is dropped instead of leaving via the VPS’s IP.',
+          { disabledWhy: !proxied ? 'Only applies when egress is Via proxy.' : !f.exit_node ? 'Only applies while the exit node is on.' : null }),
+        toggle('proxy_dns', 'DNS through the proxy', 'Exit-node clients resolve names with DNS-over-HTTPS through the proxy, so the datacenter’s resolver never sees them.',
+          { disabledWhy: !proxied ? 'Only applies when egress is Via proxy.' : !f.exit_node ? 'Only applies while the exit node is on.' : null })),
+      section('CLIProxyAPI', 'The API proxy in /opt/CLIProxyAPI.',
+        toggle('cliproxyapi', 'Follow the egress setting', 'Sets its proxy-url to mihomo while egress is Via proxy, and clears it for Direct. Off: leave its config alone.')),
+      section('Firewall', 'The rules on the Ports page.',
+        toggle('firewall', 'Enforce port rules', `Off leaves every port open, including this panel on ${S.panel_port}.`)),
+      section('Tailscale relay (DERP)', 'For networks that block Tailscale’s direct UDP: devices relay over HTTPS through this VPS instead of Tailscale’s shared, throttled relays.',
+        derpPanel()),
+      section('This browser', 'The secret is stored only in this browser.',
+        h('div', { class: 'opt' }, h('div', {}, h('b', { text: 'Sign out' }), h('p', { text: 'Forget the secret here. Get it again with sudo proxyctl secret.' })),
+          h('button', { class: 'btn', type: 'button', onclick: signOut }, 'Sign out')))),
+  ];
+}
+
+function derpPanel() {
+  const d = S.derp || {};
+  if (!d.installed) return h('div', { class: 'opt' }, h('div', {}, h('b', { text: 'Not installed' }),
+    h('p', {}, 'Run ', h('span', { class: 'mono', text: 'sudo bash setup.sh --derp' }), ' on the VPS.')));
+  const up = d.service === 'active';
+  return [
+    h('div', { class: 'opt' }, h('div', {}, h('b', { text: 'derper' }),
+      h('p', { class: 'mono', text: d.host ? `https://${d.host}:443` : 'no certificate yet: journalctl -u derper -n 30' })),
+      up ? pill('Running', 'ok') : pill(d.service, 'bad')),
+    d.acl ? h('div', { class: 'opt', style: 'display:block' },
+      h('b', { text: 'Tailnet policy' }),
+      h('p', { text: 'Paste this into the Tailscale admin console under Access controls, inside the top-level { }, and save. OmitDefaultRegions sends all relayed traffic through this VPS; set it to false to keep Tailscale’s relays as a fallback.' }),
+      h('pre', { class: 'snippet mono', text: d.acl }),
+      h('button', { class: 'btn', type: 'button', onclick: (e) => copy(d.acl, e.target) }, 'Copy')) : null,
+  ];
+}
+
+function signInView() {
+  const input = h('input', { type: 'password', id: 'secret', autocomplete: 'current-password', placeholder: 'Panel secret' });
+  return [h('form', { class: 'signin', onsubmit: (e) => { e.preventDefault(); SECRET = input.value.trim();
+      try { localStorage.setItem('proxyctl-secret', SECRET); } catch (err) {}
+      FLASH = null; load().then(loadExit); } },
+    h('h1', { text: 'Sign in to proxyctl' }),
+    h('p', { text: 'Run sudo proxyctl secret on the VPS and paste it here.' }),
+    flashLine(),
+    h('label', { class: 'field', for: 'secret' }, 'Secret', input),
+    h('button', { class: 'btn primary', type: 'submit' }, 'Sign in'))];
+}
+function signOut() { SECRET = ''; S = null; try { localStorage.removeItem('proxyctl-secret'); } catch (e) {} render(); }
+
+function loadingView() {
+  return [h('div', { class: 'title' }, h('div', {}, h('h1', {}, skel(160)), h('p', { class: 'lede' }, skel(320)))),
+    h('div', { class: 'card', style: 'height:180px' }), h('div', { class: 'card', style: 'height:92px' })];
+}
+
+// --- render -------------------------------------------------------------------
+function current() { const id = location.hash.slice(1); return VIEWS.some(v => v.id === id) ? id : 'overview'; }
+function render() {
+  const view = current();
+  const navItems = (cls) => VIEWS.map(v => h('a', { href: '#' + v.id, 'aria-current': v.id === view ? 'page' : null },
+    svg(v.icon), h('span', { text: v.label }),
+    cls === 'side' && v.id === 'proxies' && S ? h('span', { class: 'count num', text: String(S.proxies.length) }) : null));
+  document.getElementById('nav').replaceChildren(...navItems('side'));
+  document.getElementById('bnav').replaceChildren(...navItems('bottom'));
+  document.getElementById('host-side').textContent = S ? S.host : '';
+  document.getElementById('ts-side').textContent = S && S.tailscale_ip ? `Tailscale ${S.tailscale_ip}` : '';
+  document.getElementById('where').textContent = S ? `${VIEWS.find(v => v.id === view).label} · ${S.host}` : 'proxyctl';
+  document.getElementById('fresh').textContent = S ? `Updated ${ago(S.at)}` : '';
+  document.getElementById('refresh').hidden = !SECRET;
+  document.getElementById('signout').hidden = !SECRET;
+  const body = !SECRET ? signInView() : !S ? loadingView()
+    : { overview: overviewView, proxies: proxiesView, ports: portsView, settings: settingsView }[view]();
+  const focused = document.activeElement && document.activeElement.id;
+  document.getElementById('view').replaceChildren(...body.filter(Boolean));
+  if (focused) { const el = document.getElementById(focused); if (el) el.focus({ preventScroll: true }); }
+  document.title = S ? `${VIEWS.find(v => v.id === view).label} · ${S.host}` : 'proxyctl';
+}
+
+window.addEventListener('hashchange', () => { FLASH = null; render(); window.scrollTo(0, 0); });
+document.getElementById('refresh').addEventListener('click', () => { load(); loadExit(); });
+document.getElementById('signout').addEventListener('click', signOut);
+setInterval(() => { if (SECRET && S && !BUSY && document.visibilityState === 'visible') load(); }, 30000);
+render();
+if (SECRET) { load(); loadExit(); }
+</script>
+</body>
+</html>
