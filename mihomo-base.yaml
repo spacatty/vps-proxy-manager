@@ -1,5 +1,7 @@
-# mihomo (Clash Meta) config for the VPS exit node.
-# Edit only two things: `secret` and the `proxies` list (and the group below).
+# mihomo (Clash Meta) base config for the VPS exit node.
+# Installed as /etc/mihomo/base.yaml. proxyctl appends `secret`, `proxies` and
+# `proxy-groups` (from /etc/mihomo/state.json) to build /etc/mihomo/config.yaml,
+# so don't add those keys here. Manage proxies with the panel or `proxyctl`.
 
 mode: rule
 log-level: info
@@ -13,7 +15,6 @@ profile:
 
 # --- Web UI / API (setup.sh firewalls port 9090 to tailscale0 only) ---------
 external-controller: 0.0.0.0:9090
-secret: "CHANGE-ME"         # put a long random string here
 external-ui: ui
 external-ui-url: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
 
@@ -36,7 +37,7 @@ sniffer:
       ports: [80, 8080]
       override-destination: true
 
-# --- DNS: the VPS resolver points here; upstream DoH goes through the proxy -
+# --- DNS: while routing is on, the VPS resolver points here; DoH goes via the proxy
 dns:
   enable: true
   listen: 127.0.0.1:53
@@ -48,32 +49,7 @@ dns:
     - "https://1.1.1.1/dns-query#PROXY"
     - "https://8.8.8.8/dns-query#PROXY"
 
-# --- Your ISP SOCKS5 proxies (use IPs, simple names without spaces) ---------
-proxies:
-  - name: isp-1
-    type: socks5
-    server: 203.0.113.10
-    port: 1080
-    username: user
-    password: pass
-    udp: true               # harmless if the provider has no UDP; UDP just fails
-
-  - name: isp-2
-    type: socks5
-    server: 203.0.113.20
-    port: 1080
-    username: user
-    password: pass
-    udp: true
-
-# Manual selector you switch in the UI / proxyctl.
-# DIRECT is deliberately NOT listed, so nothing can leave via the VPS's own IP.
-proxy-groups:
-  - name: PROXY
-    type: select
-    proxies:
-      - isp-1
-      - isp-2
-
+# The PROXY group is generated: your proxies, then REJECT.
+# DIRECT is never in it, so nothing can leave via the VPS's own IP.
 rules:
   - MATCH,PROXY

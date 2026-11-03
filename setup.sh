@@ -6,11 +6,8 @@ set -euo pipefail
 
 [ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo bash setup.sh"; exit 1; }
 cd "$(dirname "$0")"
-[ -f config.yaml ] || { echo "config.yaml not found next to setup.sh"; exit 1; }
-sed -i 's/\r$//' config.yaml proxyctl 2>/dev/null || true   # strip Windows line endings
-if grep -q 'CHANGE-ME' config.yaml; then
-  echo "Edit config.yaml first: set 'secret' and your proxies."; exit 1
-fi
+[ -f mihomo-base.yaml ] || { echo "mihomo-base.yaml not found next to setup.sh"; exit 1; }
+sed -i 's/\r$//' mihomo-base.yaml proxyctl 2>/dev/null || true   # strip Windows line endings
 
 WAN_IF=$(ip -4 route show default | awk '{print $5; exit}')
 [ -n "$WAN_IF" ] || { echo "Could not detect the WAN interface"; exit 1; }
@@ -22,9 +19,8 @@ apt-get install -y curl gzip unzip tar iptables iproute2 python3 ca-certificates
 
 echo "==> Tailscale"
 command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
-cat >/etc/sysctl.d/99-exit-node.conf <<'EOF'
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
+# IP forwarding is turned on by `proxyctl routing on` (it appends to this file).
+grep -qs 'rp_filter' /etc/sysctl.d/99-exit-node.conf || cat >>/etc/sysctl.d/99-exit-node.conf <<'EOF'
 net.ipv4.conf.all.rp_filter=2
 net.ipv4.conf.default.rp_filter=2
 EOF
@@ -44,8 +40,11 @@ chmod +x /usr/local/bin/mihomo
 /usr/local/bin/mihomo -v
 
 mkdir -p /etc/mihomo/ui
-[ -f /etc/mihomo/config.yaml ] && cp /etc/mihomo/config.yaml "/etc/mihomo/config.yaml.bak.$(date +%s)"
-install -m 600 config.yaml /etc/mihomo/config.yaml
+install -m 644 mihomo-base.yaml /etc/mihomo/base.yaml
+install -m 755 proxyctl /usr/local/bin/proxyctl
+# Creates the panel/API secret on first run (kept on re-runs) and writes config.yaml.
+# No proxies yet: the PROXY group is just REJECT until you add some.
+proxyctl init
 
 echo "==> Web UI (metacubexd)"
 # Non-fatal: if this download fails, mihomo fetches the UI itself on first start.
@@ -72,9 +71,11 @@ ip route replace throw 100.64.0.0/10 table 100
 # Second layer: never forward Tailscale traffic straight out of the WAN NIC.
 iptables  -t mangle -C FORWARD -i tailscale0 -o $WAN_IF -j DROP 2>/dev/null || iptables  -t mangle -I FORWARD 1 -i tailscale0 -o $WAN_IF -j DROP
 ip6tables -t mangle -C FORWARD -i tailscale0 -j DROP 2>/dev/null           || ip6tables -t mangle -I FORWARD 1 -i tailscale0 -j DROP
-# Web UI/API only reachable over Tailscale.
-iptables  -C INPUT -p tcp --dport 9090 ! -i tailscale0 -j DROP 2>/dev/null || iptables  -I INPUT 1 -p tcp --dport 9090 ! -i tailscale0 -j DROP
-ip6tables -C INPUT -p tcp --dport 9090 ! -i tailscale0 -j DROP 2>/dev/null || ip6tables -I INPUT 1 -p tcp --dport 9090 ! -i tailscale0 -j DROP
+# mihomo UI/API (9090) and the proxyctl panel (9091) only reachable over Tailscale.
+for PORT in 9090 9091; do
+  iptables  -C INPUT -p tcp --dport \$PORT ! -i tailscale0 -j DROP 2>/dev/null || iptables  -I INPUT 1 -p tcp --dport \$PORT ! -i tailscale0 -j DROP
+  ip6tables -C INPUT -p tcp --dport \$PORT ! -i tailscale0 -j DROP 2>/dev/null || ip6tables -I INPUT 1 -p tcp --dport \$PORT ! -i tailscale0 -j DROP
+done
 exit 0
 EOF
 chmod +x /usr/local/sbin/exitnode-killswitch.sh
@@ -123,43 +124,38 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-install -m 755 proxyctl /usr/local/bin/proxyctl
+cat >/etc/systemd/system/proxyctl-web.service <<'EOF'
+[Unit]
+Description=proxyctl web panel (proxies + routing), port 9091, Tailscale only
+After=mihomo.service
+
+[Service]
+ExecStart=/usr/local/bin/proxyctl serve
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 systemctl daemon-reload
 systemctl enable --now exitnode-killswitch.service
-systemctl enable mihomo.service
-systemctl restart mihomo.service
-sleep 3
+systemctl enable mihomo.service proxyctl-web.service
+systemctl restart mihomo.service proxyctl-web.service
 
-echo "==> Checking the proxy works before switching DNS"
-EXIT_IP=$(curl -s --max-time 15 -x http://127.0.0.1:7890 https://api.ipify.org || true)
-if [ -z "$EXIT_IP" ]; then
-  echo "!! Could not reach the internet through the selected proxy."
-  echo "   Check proxies in /etc/mihomo/config.yaml, then: systemctl restart mihomo; journalctl -u mihomo -n 50"
-  echo "   DNS was NOT switched yet. Re-run setup.sh once the proxy works."
-  exit 1
-fi
-echo "    Exit IP via proxy: $EXIT_IP"
-
-echo "==> System DNS -> mihomo (DoH through the proxy)"
-systemctl disable --now systemd-resolved 2>/dev/null || true
-rm -f /etc/resolv.conf
-printf 'nameserver 127.0.0.1\noptions edns0\n' > /etc/resolv.conf
-
-echo "==> Advertising this VPS as a Tailscale exit node"
-if tailscale status >/dev/null 2>&1; then
-  tailscale set --advertise-exit-node
-else
-  tailscale up --advertise-exit-node
-fi
+echo "==> Tailscale login"
+# Not advertised as an exit node yet: that's `proxyctl routing on`, once a proxy works.
+tailscale status >/dev/null 2>&1 || tailscale up
 
 TS_IP=$(tailscale ip -4 2>/dev/null | head -n1 || true)
 cat <<EOF
 
-Done.
-  1. Tailscale admin console -> Machines -> this VPS -> Edit route settings -> tick "Use as exit node".
-     Also "Disable key expiry" for it.
-  2. Web UI:  http://${TS_IP:-<vps-tailscale-ip>}:9090/ui
-     Backend: http://${TS_IP:-<vps-tailscale-ip>}:9090   Secret: the one in config.yaml
-  3. On the VPS:  proxyctl status | proxyctl list | proxyctl use <name> | proxyctl test
+Done. Nothing is routed yet. Next:
+  1. Open the panel from a device on your tailnet: http://${TS_IP:-<vps-tailscale-ip>}:9091
+     Secret: $(proxyctl secret)
+  2. Add a proxy there (or: proxyctl add isp-1 socks5://user:pass@host:port), then "Start routing"
+     (or: proxyctl routing on). It checks the proxy works before turning anything on.
+  3. First time only: Tailscale admin console -> Machines -> this VPS -> Edit route settings ->
+     tick "Use as exit node", and "Disable key expiry".
+  Live connections/logs: http://${TS_IP:-<vps-tailscale-ip>}:9090/ui (same secret)
 EOF
