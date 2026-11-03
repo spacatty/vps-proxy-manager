@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# proxyctl - tiny CLI for the mihomo exit node.
+#   proxyctl status        service state, selected proxy, exit IP
+#   proxyctl list          proxies in the group (* = active)
+#   proxyctl use NAME      switch the active proxy
+#   proxyctl test          latency of every proxy
+#   proxyctl forwarding    check IP forwarding, enable it (persistently) if off
+set -euo pipefail
+CONF=/etc/mihomo/config.yaml
+API=http://127.0.0.1:9090
+GROUP=PROXY
+SYSCTL_FILE=/etc/sysctl.d/99-exit-node.conf
+SECRET=$(sed -nE 's/^secret:[[:space:]]*"?([^"#]*)"?.*/\1/p' "$CONF" 2>/dev/null | head -n1 | sed 's/[[:space:]]*$//' || true)
+AUTH=(-H "Authorization: Bearer ${SECRET}")
+
+api() { curl -fsS --max-time 15 "${AUTH[@]}" "$@"; }
+
+# "on" only if both IPv4 and IPv6 forwarding are enabled (Tailscale wants both)
+fwd_state() {
+  [ "$(sysctl -n net.ipv4.ip_forward)" = 1 ] && [ "$(sysctl -n net.ipv6.conf.all.forwarding)" = 1 ] \
+    && echo on || echo OFF
+}
+
+case "${1:-status}" in
+  status)
+    printf 'forwarding: %s\n' "$(fwd_state)"
+    printf 'mihomo:     %s\n' "$(systemctl is-active mihomo 2>/dev/null || echo unknown)"
+    printf 'kill switch: %s\n' "$(ip rule show priority 100 | grep -q 'lookup 100' && echo on || echo OFF)"
+    printf 'tun route:  %s\n' "$(ip route show table 100 | grep -q 'dev tun0' && echo up || echo 'down (blackholed)')"
+    NOW=$(api "$API/proxies/$GROUP" | python3 -c 'import sys,json;print(json.load(sys.stdin)["now"])' || echo '?')
+    printf 'selected:   %s\n' "$NOW"
+    INFO=$(curl -s --max-time 15 -x http://127.0.0.1:7890 https://ipinfo.io/json || true)
+    if [ -n "$INFO" ]; then
+      echo "$INFO" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("exit IP:    %s  %s, %s  %s" % (d.get("ip"),d.get("city"),d.get("country"),d.get("org")))'
+    else
+      echo "exit IP:    unreachable (proxy down?)"
+    fi
+    ;;
+  list)
+    api "$API/proxies/$GROUP" | python3 -c 'import sys,json;d=json.load(sys.stdin);[print(("* " if p==d["now"] else "  ")+p) for p in d["all"]]'
+    ;;
+  use)
+    [ -n "${2:-}" ] || { echo "usage: proxyctl use NAME"; exit 1; }
+    api -X PUT -H 'Content-Type: application/json' -d "{\"name\":\"$2\"}" "$API/proxies/$GROUP" -o /dev/null
+    echo "switched to $2"
+    # existing connections keep the old IP; close them so everything moves over
+    api -X DELETE "$API/connections" -o /dev/null || true
+    ;;
+  test)
+    for p in $(api "$API/proxies/$GROUP" | python3 -c 'import sys,json;print(" ".join(json.load(sys.stdin)["all"]))'); do
+      R=$(api "$API/proxies/$p/delay?url=https://www.gstatic.com/generate_204&timeout=5000" 2>/dev/null \
+          | python3 -c 'import sys,json;print(str(json.load(sys.stdin).get("delay"))+" ms")' || echo "timeout")
+      printf '%-20s %s\n' "$p" "$R"
+    done
+    ;;
+  forwarding)
+    printf 'ipv4 forwarding: %s\n' "$(sysctl -n net.ipv4.ip_forward)"
+    printf 'ipv6 forwarding: %s\n' "$(sysctl -n net.ipv6.conf.all.forwarding)"
+    if [ "$(fwd_state)" = on ]; then
+      echo "forwarding is on"
+      exit 0
+    fi
+    [ "$(id -u)" -eq 0 ] || { echo "forwarding is OFF, re-run as root to enable it: sudo proxyctl forwarding"; exit 1; }
+    # write it to sysctl.d so it survives reboots, then apply now
+    grep -qs '^net.ipv4.ip_forward=1' "$SYSCTL_FILE" || echo 'net.ipv4.ip_forward=1' >> "$SYSCTL_FILE"
+    grep -qs '^net.ipv6.conf.all.forwarding=1' "$SYSCTL_FILE" || echo 'net.ipv6.conf.all.forwarding=1' >> "$SYSCTL_FILE"
+    sysctl -q -w net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
+    echo "forwarding enabled (saved in $SYSCTL_FILE)"
+    ;;
+  *) sed -n '2,8p' "$0"; exit 1 ;;
+esac
